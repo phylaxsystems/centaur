@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, RwLock},
     time::Duration,
@@ -13,7 +15,9 @@ use absurd::{
 };
 use centaur_iron_control::{IdentityInput, IronControlClient, IronControlError, slugify};
 use centaur_sandbox_core::SandboxSpec;
-use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    HarnessType, MessageRole, SessionEvent, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SandboxRuntime,
     SessionRuntime,
@@ -22,7 +26,7 @@ use centaur_session_sqlx::PgSessionStore;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
-use futures_util::{TryStreamExt, pin_mut};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -47,6 +51,7 @@ const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
+const AGENT_EVENT_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKFLOW_HOST_CLAIM_EXTENSION: Duration = Duration::from_secs(5 * 60);
 const WORKFLOW_HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_SECS";
@@ -508,6 +513,28 @@ struct AgentTurnResult {
     status: String,
     output_lines: Vec<String>,
     result_text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PythonAgentTurnResult {
+    thread_key: String,
+    execution_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_lines: Option<Vec<String>>,
+    result_text: String,
+}
+
+impl PythonAgentTurnResult {
+    fn from_agent_turn(result: AgentTurnResult, include_output_lines: bool) -> Self {
+        Self {
+            thread_key: result.thread_key,
+            execution_id: result.execution_id,
+            status: result.status,
+            output_lines: include_output_lines.then_some(result.output_lines),
+            result_text: result.result_text,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2996,7 +3023,8 @@ async fn run_python_workflow_host_local(
                         return Err(error);
                     }
                 };
-                write_host_message(&mut stdin, &response).await?;
+                write_python_context_response(&mut stdin, &message, &response, &ctx, &input)
+                    .await?;
             }
             other => {
                 return Err(WorkflowRuntimeError::Internal(format!(
@@ -3137,7 +3165,7 @@ where
                     &workflow_clients,
                 )
                 .await?;
-                write_host_message(stdin, &response).await?;
+                write_python_context_response(stdin, &message, &response, &ctx, &input).await?;
             }
             other => {
                 return Err(WorkflowRuntimeError::Internal(format!(
@@ -3151,6 +3179,42 @@ where
     Err(WorkflowRuntimeError::Internal(format!(
         "Python workflow host exited before workflow.result: stderr={stderr}"
     )))
+}
+
+async fn write_python_context_response<W>(
+    stdin: &mut W,
+    request: &Value,
+    response: &Value,
+    ctx: &TaskContext,
+    input: &WorkflowTaskInput,
+) -> Result<(), WorkflowRuntimeError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let serialized_bytes = serde_json::to_vec(response)?.len() + 1;
+    write_host_message(stdin, response).await?;
+    info!(
+        component = "centaur_workflows",
+        event = "workflow_context_response_written",
+        workflow_name = input.workflow_name,
+        workflow_task_id = ctx.task_id(),
+        workflow_run_id = ctx.run_id(),
+        request_id = request
+            .get("request_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+        request_type = request
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+        response_ok = response
+            .get("ok")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        serialized_bytes,
+        "serialized and wrote Python workflow context response"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3614,6 +3678,7 @@ async fn run_python_agent_turn(
     let model = first_str_arg(&args, &["model"]);
     let provider = first_str_arg(&args, &["provider"]);
     let reasoning = first_str_arg(&args, &["reasoning", "reasoning_effort", "effort"]);
+    let include_output_lines = parse_include_output_lines(&args)?;
     // Record the model on the execution like the slackbot does, so Console
     // readers can show what a workflow-dispatched turn ran on.
     if let Some(model) = model.as_deref() {
@@ -3640,7 +3705,21 @@ async fn run_python_agent_turn(
         },
     )
     .await?;
-    serde_json::to_value(result).map_err(WorkflowRuntimeError::from)
+    serde_json::to_value(PythonAgentTurnResult::from_agent_turn(
+        result,
+        include_output_lines,
+    ))
+    .map_err(WorkflowRuntimeError::from)
+}
+
+fn parse_include_output_lines(args: &Value) -> Result<bool, WorkflowRuntimeError> {
+    match args.get("include_output_lines") {
+        None => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(WorkflowRuntimeError::BadRequest(
+            "ctx.agent_turn include_output_lines must be boolean".to_owned(),
+        )),
+    }
 }
 
 /// Returns the first arg key that holds a non-empty (trimmed) string, owned.
@@ -4028,50 +4107,152 @@ async fn run_agent_session_turn(
         )
         .await?;
 
-    let events = session_runtime
-        .stream_events(&thread_key, 0, Some(&execution.execution_id))
-        .await?;
-    pin_mut!(events);
-    let mut output_lines = Vec::new();
-    while let Some(event) = events.try_next().await? {
-        if event.execution_id.as_deref() != Some(execution.execution_id.as_str()) {
-            continue;
+    let execution_id = execution.execution_id;
+    let stream_runtime = session_runtime.clone();
+    let stream_thread_key = thread_key.clone();
+    let stream_execution_id = execution_id.clone();
+    let terminal = wait_for_agent_terminal_event(
+        &execution_id,
+        AGENT_EVENT_STREAM_WAIT_TIMEOUT,
+        move |after_event_id| {
+            let runtime = stream_runtime.clone();
+            let thread_key = stream_thread_key.clone();
+            let execution_id = stream_execution_id.clone();
+            async move {
+                let events = runtime
+                    .stream_events(&thread_key, after_event_id, Some(&execution_id))
+                    .await?;
+                Ok(events.map_err(WorkflowRuntimeError::from).boxed() as AgentEventStream)
+            }
+        },
+    )
+    .await?;
+
+    info!(
+        component = "centaur_workflows",
+        event = "workflow_agent_terminal_consumed",
+        thread_key = %thread_key,
+        execution_id,
+        terminal_event_id = terminal.event_id,
+        terminal_status = terminal.event_type,
+        output_line_count = terminal.output_lines.len(),
+        "consumed workflow agent terminal event"
+    );
+
+    if terminal.event_type == "session.execution_completed" {
+        return Ok(AgentTurnResult {
+            thread_key: thread_key.into_string(),
+            execution_id,
+            status: "completed".to_owned(),
+            result_text: terminal.result_text,
+            output_lines: terminal.output_lines,
+        });
+    }
+
+    Err(WorkflowRuntimeError::Upstream(format!(
+        "agent turn {} for thread {} ended with {}",
+        execution_id, thread_key, terminal.event_type
+    )))
+}
+
+type AgentEventStream =
+    Pin<Box<dyn Stream<Item = Result<SessionEvent, WorkflowRuntimeError>> + Send>>;
+
+struct AgentTurnTerminalEvent {
+    event_id: i64,
+    event_type: String,
+    result_text: String,
+    output_lines: Vec<String>,
+}
+
+struct AgentTurnEventState<'a> {
+    execution_id: &'a str,
+    last_event_id: i64,
+    output_lines: Vec<String>,
+}
+
+impl<'a> AgentTurnEventState<'a> {
+    fn new(execution_id: &'a str) -> Self {
+        Self {
+            execution_id,
+            last_event_id: 0,
+            output_lines: Vec::new(),
+        }
+    }
+
+    fn consume(&mut self, event: SessionEvent) -> Option<AgentTurnTerminalEvent> {
+        self.last_event_id = self.last_event_id.max(event.event_id);
+        if event.execution_id.as_deref() != Some(self.execution_id) {
+            return None;
         }
         match event.event_type.as_str() {
             SESSION_OUTPUT_LINE_EVENT => {
                 if let Some(line) = event.payload.as_str() {
-                    output_lines.push(line.to_owned());
+                    self.output_lines.push(line.to_owned());
                 }
+                None
             }
-            "session.execution_completed" => {
-                return Ok(AgentTurnResult {
-                    thread_key: thread_key.into_string(),
-                    execution_id: execution.execution_id,
-                    status: "completed".to_owned(),
-                    result_text: result_text_from_output_lines(&output_lines),
-                    output_lines,
-                });
-            }
-            "session.execution_failed" | "session.execution_cancelled" => {
-                let result = AgentTurnResult {
-                    thread_key: thread_key.into_string(),
-                    execution_id: execution.execution_id,
-                    status: event.event_type,
-                    result_text: result_text_from_output_lines(&output_lines),
-                    output_lines,
-                };
-                return Err(WorkflowRuntimeError::Upstream(format!(
-                    "agent turn {} for thread {} ended with {}",
-                    result.execution_id, result.thread_key, result.status
-                )));
-            }
-            _ => {}
+            "session.execution_completed"
+            | "session.execution_failed"
+            | "session.execution_cancelled" => Some(AgentTurnTerminalEvent {
+                event_id: event.event_id,
+                event_type: event.event_type,
+                result_text: terminal_result_text(&event.payload, &self.output_lines),
+                output_lines: std::mem::take(&mut self.output_lines),
+            }),
+            _ => None,
         }
     }
+}
 
-    Err(WorkflowRuntimeError::Upstream(
-        "session event stream ended before terminal execution event".to_owned(),
-    ))
+async fn wait_for_agent_terminal_event<OpenStream, OpenFuture>(
+    execution_id: &str,
+    event_wait_timeout: Duration,
+    mut open_stream: OpenStream,
+) -> Result<AgentTurnTerminalEvent, WorkflowRuntimeError>
+where
+    OpenStream: FnMut(i64) -> OpenFuture,
+    OpenFuture: Future<Output = Result<AgentEventStream, WorkflowRuntimeError>>,
+{
+    let mut state = AgentTurnEventState::new(execution_id);
+    loop {
+        let mut events = open_stream(state.last_event_id).await?;
+        loop {
+            match tokio::time::timeout(event_wait_timeout, events.try_next()).await {
+                Ok(Ok(Some(event))) => {
+                    if let Some(terminal) = state.consume(event) {
+                        return Ok(terminal);
+                    }
+                }
+                Ok(Ok(None)) => {
+                    return Err(WorkflowRuntimeError::Upstream(
+                        "session event stream ended before terminal execution event".to_owned(),
+                    ));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    warn!(
+                        component = "centaur_workflows",
+                        event = "workflow_agent_event_stream_resubscribing",
+                        execution_id,
+                        after_event_id = state.last_event_id,
+                        "workflow agent event stream timed out; resubscribing from durable cursor"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn terminal_result_text(payload: &Value, output_lines: &[String]) -> String {
+    payload
+        .get("result_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| result_text_from_output_lines(output_lines))
 }
 
 fn result_text_from_output_lines(lines: &[String]) -> String {
@@ -4164,6 +4345,26 @@ pub enum WorkflowRuntimeError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn agent_session_event(
+        event_id: i64,
+        execution_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) -> SessionEvent {
+        SessionEvent {
+            event_id,
+            thread_key: ThreadKey::parse("workflow:test:agent").unwrap(),
+            execution_id: Some(execution_id.to_owned()),
+            event_type: event_type.to_owned(),
+            payload,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
 
     #[test]
     fn python_event_names_are_collision_free() {
@@ -4205,6 +4406,156 @@ mod tests {
         assert_eq!(value.get("provider"), Some(&json!("amazon-bedrock")));
         assert_eq!(value.get("reasoning"), Some(&json!("high")));
         assert_eq!(value.pointer("/message/content"), Some(&json!(parts)));
+    }
+
+    #[tokio::test]
+    async fn agent_turn_resubscribes_exact_execution_from_last_event_without_reexecution() {
+        let execution_id = "exe_recovered";
+        let subscriptions = Arc::new(AtomicUsize::new(0));
+        let cursors = Arc::new(Mutex::new(Vec::new()));
+        let subscriptions_for_open = subscriptions.clone();
+        let cursors_for_open = cursors.clone();
+
+        let terminal = wait_for_agent_terminal_event(
+            execution_id,
+            Duration::from_millis(10),
+            move |after_event_id| {
+                cursors_for_open.lock().unwrap().push(after_event_id);
+                let subscription = subscriptions_for_open.fetch_add(1, Ordering::SeqCst);
+                let stream: AgentEventStream = match subscription {
+                    0 => futures_util::stream::iter(vec![Ok(agent_session_event(
+                        41,
+                        execution_id,
+                        SESSION_OUTPUT_LINE_EVENT,
+                        json!({"delta": "fallback"}).to_string().into(),
+                    ))])
+                    .chain(futures_util::stream::pending())
+                    .boxed(),
+                    1 => futures_util::stream::iter(vec![Ok(agent_session_event(
+                        42,
+                        execution_id,
+                        "session.execution_completed",
+                        json!({"result_text": "persisted terminal"}),
+                    ))])
+                    .boxed(),
+                    other => panic!("unexpected subscription {other}"),
+                };
+                async move { Ok(stream) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(terminal.event_id, 42);
+        assert_eq!(terminal.result_text, "persisted terminal");
+        assert_eq!(terminal.output_lines.len(), 1);
+        assert_eq!(*cursors.lock().unwrap(), vec![0, 41]);
+        assert_eq!(subscriptions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn agent_turn_stream_accepts_400_to_500kb_multiline_control() {
+        let execution_id = "exe_large_control";
+        let mut events = (1..=450)
+            .map(|event_id| {
+                Ok(agent_session_event(
+                    event_id,
+                    execution_id,
+                    SESSION_OUTPUT_LINE_EVENT,
+                    Value::String(json!({"delta": "x".repeat(1_000)}).to_string()),
+                ))
+            })
+            .collect::<Vec<Result<SessionEvent, WorkflowRuntimeError>>>();
+        events.push(Ok(agent_session_event(
+            451,
+            execution_id,
+            "session.execution_completed",
+            json!({"result_text": "r".repeat(6_690)}),
+        )));
+        let mut events = Some(events);
+
+        let terminal = wait_for_agent_terminal_event(
+            execution_id,
+            Duration::from_secs(1),
+            move |after_event_id| {
+                assert_eq!(after_event_id, 0);
+                let stream: AgentEventStream =
+                    futures_util::stream::iter(events.take().unwrap()).boxed();
+                async move { Ok(stream) }
+            },
+        )
+        .await
+        .unwrap();
+
+        let transcript_bytes = terminal.output_lines.iter().map(String::len).sum::<usize>();
+        assert!((400 * 1024..500 * 1024).contains(&transcript_bytes));
+        assert_eq!(terminal.output_lines.len(), 450);
+        assert_eq!(terminal.result_text.len(), 6_690);
+    }
+
+    #[test]
+    fn terminal_result_text_prefers_persisted_result() {
+        let output_lines = vec![json!({"delta": "fallback"}).to_string()];
+
+        assert_eq!(
+            terminal_result_text(
+                &json!({"result_text": "  persisted final report  "}),
+                &output_lines,
+            ),
+            "persisted final report"
+        );
+        assert_eq!(terminal_result_text(&json!({}), &output_lines), "fallback");
+    }
+
+    #[test]
+    fn python_agent_turn_result_can_omit_three_mb_raw_transcript() {
+        let result = AgentTurnResult {
+            thread_key: "workflow:test:run".to_owned(),
+            execution_id: "exe_test".to_owned(),
+            status: "completed".to_owned(),
+            output_lines: vec!["x".repeat(3 * 1024 * 1024)],
+            result_text: "final report".to_owned(),
+        };
+
+        let value =
+            serde_json::to_value(PythonAgentTurnResult::from_agent_turn(result, false)).unwrap();
+
+        assert_eq!(value.get("result_text"), Some(&json!("final report")));
+        assert!(value.get("output_lines").is_none());
+        assert!(serde_json::to_vec(&value).unwrap().len() < 1_024);
+    }
+
+    #[test]
+    fn python_agent_turn_result_includes_raw_output_lines_by_default() {
+        let result = AgentTurnResult {
+            thread_key: "workflow:test:run".to_owned(),
+            execution_id: "exe_test".to_owned(),
+            status: "completed".to_owned(),
+            output_lines: vec!["raw event".to_owned()],
+            result_text: "final report".to_owned(),
+        };
+
+        let value =
+            serde_json::to_value(PythonAgentTurnResult::from_agent_turn(result, true)).unwrap();
+
+        assert_eq!(value.get("output_lines"), Some(&json!(["raw event"])));
+    }
+
+    #[test]
+    fn include_output_lines_is_strict_and_defaults_to_compatible_shape() {
+        assert!(parse_include_output_lines(&json!({})).unwrap());
+        assert!(
+            !parse_include_output_lines(&json!({
+                "include_output_lines": false
+            }))
+            .unwrap()
+        );
+        assert!(
+            parse_include_output_lines(&json!({"include_output_lines": "false"}))
+                .unwrap_err()
+                .to_string()
+                .contains("include_output_lines must be boolean")
+        );
     }
 
     #[test]
