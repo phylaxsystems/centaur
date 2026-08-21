@@ -3764,13 +3764,7 @@ async fn post_tool_result_to_slack(
     note: &str,
     tool: &ToolResult,
 ) -> Result<SlackPostResult, WorkflowRuntimeError> {
-    let token = env::var("SLACK_BOT_TOKEN")
-        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
-        .map_err(|_| {
-            WorkflowRuntimeError::BadRequest(
-                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
-            )
-        })?;
+    let token = workflow_slack_bot_token()?;
     let text = format!(
         "{note}\nworkflow=tool_and_slack\ntool={}.{}\nresult={}",
         tool.tool,
@@ -3812,17 +3806,31 @@ async fn post_python_slack_message(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{}:slack:{request_id}", ctx.task_id()));
 
-    let token = env::var("SLACK_BOT_TOKEN")
-        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
-        .map_err(|_| {
-            WorkflowRuntimeError::BadRequest(
-                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
-            )
-        })?;
+    let token = workflow_slack_bot_token()?;
     let payload = python_slack_message_payload(channel, text, &client_msg_id, &args);
     let response = send_slack_message(&token, payload).await?;
     serde_json::to_value(slack_post_result_from_response(channel, response))
         .map_err(WorkflowRuntimeError::from)
+}
+
+fn workflow_slack_bot_token() -> Result<String, WorkflowRuntimeError> {
+    normalized_slack_bot_token(
+        env::var("SLACK_BOT_TOKEN").ok(),
+        env::var("SLACK_BOT_TOKEN_OVERRIDE").ok(),
+    )
+    .ok_or_else(|| {
+        WorkflowRuntimeError::BadRequest(
+            "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must contain a non-empty token".to_owned(),
+        )
+    })
+}
+
+fn normalized_slack_bot_token(primary: Option<String>, fallback: Option<String>) -> Option<String> {
+    [primary, fallback]
+        .into_iter()
+        .flatten()
+        .map(|token| token.trim().to_owned())
+        .find(|token| !token.is_empty())
 }
 
 fn python_slack_message_payload(
@@ -4382,6 +4390,29 @@ mod tests {
         assert_eq!(payload["reply_broadcast"], json!(true));
         assert_eq!(payload["unfurl_links"], json!(true));
         assert_eq!(payload["unfurl_media"], json!(true));
+    }
+
+    #[test]
+    fn workflow_slack_token_trims_surrounding_whitespace() {
+        assert_eq!(
+            normalized_slack_bot_token(Some("  xoxb-token\n".to_owned()), None),
+            Some("xoxb-token".to_owned())
+        );
+    }
+
+    #[test]
+    fn workflow_slack_token_falls_back_after_empty_primary() {
+        assert_eq!(
+            normalized_slack_bot_token(
+                Some(" \n\t".to_owned()),
+                Some("  override-token  ".to_owned()),
+            ),
+            Some("override-token".to_owned())
+        );
+        assert_eq!(
+            normalized_slack_bot_token(Some(" \n\t".to_owned()), None),
+            None
+        );
     }
 
     #[test]
