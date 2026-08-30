@@ -452,6 +452,11 @@ apiRs:
   # then pausing least-recently-active idle session sandboxes. 0 disables.
   sandboxRunningLimit: 0
   sandboxHotIdleGraceSecs: 300
+  # How long an admission blocked by sandboxRunningLimit waits for a slot
+  # before failing the turn. A refused turn is terminal: nothing retries it and
+  # nothing surfaces on the originating thread, while the slot it needed
+  # usually frees seconds later. 0 fails at once.
+  sandboxAdmissionWaitSecs: 600
   # When true, api-rs upserts the shared iron-control infra role and its
   # backing secrets at startup and on tool-secret reconciliation intervals.
   # Set false when multiple Centaur instances share one console/1Password

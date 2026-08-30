@@ -610,6 +610,17 @@ struct SandboxArgs {
         default_value_t = 300
     )]
     sandbox_hot_idle_grace_secs: u64,
+    /// How long an admission blocked by the running limit waits for a slot to
+    /// open before failing the turn. A refused turn is terminal -- nothing
+    /// retries it and nothing surfaces on the originating thread -- while the
+    /// slot it needed usually frees seconds later. 0 fails at once, which is
+    /// the behaviour before this existed.
+    #[arg(
+        long = "session-sandbox-admission-wait-secs",
+        env = "SESSION_SANDBOX_ADMISSION_WAIT_SECS",
+        default_value_t = 600
+    )]
+    sandbox_admission_wait_secs: u64,
     /// Stop any sandbox older than this regardless of status; sessions replace
     /// reaped sandboxes on their next message. 0 disables the max-lifetime
     /// sweep.
@@ -1428,6 +1439,7 @@ impl SandboxArgs {
         (self.sandbox_running_limit > 0).then(|| SandboxCapacityConfig {
             max_running: self.sandbox_running_limit,
             hot_idle_grace: Duration::from_secs(self.sandbox_hot_idle_grace_secs),
+            admission_wait: Duration::from_secs(self.sandbox_admission_wait_secs),
         })
     }
 

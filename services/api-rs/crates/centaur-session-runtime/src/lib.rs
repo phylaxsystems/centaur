@@ -66,6 +66,10 @@ const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
 const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
+/// How long a blocked admission sleeps between slot re-checks. Short enough
+/// that a freed slot is taken promptly, long enough not to spin the backend's
+/// observe call.
+const ADMISSION_WAIT_TICK: Duration = Duration::from_secs(2);
 const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const EXECUTION_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const EXECUTION_HANDOFF_DB_TIMEOUT: Duration = Duration::from_secs(5);
@@ -164,6 +168,10 @@ pub struct SessionRuntime {
 pub struct SandboxCapacityConfig {
     pub max_running: usize,
     pub hot_idle_grace: Duration,
+    /// How long a blocked admission waits for a running slot before failing
+    /// with `CapacityExceeded`. Zero fails at once, which is the behaviour
+    /// before this existed.
+    pub admission_wait: Duration,
 }
 
 impl SandboxCapacityConfig {
@@ -493,10 +501,102 @@ impl SandboxCapacityController {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, SessionRuntimeError>>,
     {
-        let _guard = self.lock.lock().await;
-        self.ensure_running_slot(protected_thread_key, trigger_execution_id, operation)
-            .await?;
-        action().await
+        let deadline = Instant::now() + self.config.admission_wait;
+        let mut recorded_wait = false;
+        loop {
+            let guard = self.lock.lock().await;
+            match self
+                .ensure_running_slot(protected_thread_key, trigger_execution_id, operation)
+                .await
+            {
+                Ok(()) => return action().await,
+                Err(SessionRuntimeError::CapacityExceeded {
+                    max_running,
+                    running,
+                    ..
+                }) => {
+                    if Instant::now() >= deadline {
+                        return Err(SessionRuntimeError::CapacityExceeded {
+                            max_running,
+                            running,
+                            operation,
+                        });
+                    }
+                    if !recorded_wait {
+                        self.record_capacity_waiting(
+                            protected_thread_key,
+                            trigger_execution_id,
+                            operation,
+                            running,
+                            max_running,
+                            deadline,
+                        )
+                        .await;
+                        recorded_wait = true;
+                    }
+                    // Release the admission lock while sleeping. Holding it
+                    // would head-of-line every other turn behind this one,
+                    // including the ones whose completion frees the slot it is
+                    // waiting for. Re-taking it per attempt keeps admission
+                    // atomic, so the cap is still never exceeded.
+                    drop(guard);
+                    sleep(ADMISSION_WAIT_TICK).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Record the durable "waiting for a sandbox slot" state once per blocked
+    /// admission. A failed append must not fail the wait: losing the event
+    /// costs visibility, losing the turn costs the work.
+    async fn record_capacity_waiting(
+        &self,
+        protected_thread_key: &ThreadKey,
+        trigger_execution_id: &str,
+        operation: &'static str,
+        running: usize,
+        max_running: usize,
+        deadline: Instant,
+    ) {
+        let wait_secs = deadline.saturating_duration_since(Instant::now()).as_secs();
+        info!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "sandbox_capacity_waiting",
+            trigger_thread_key = %protected_thread_key,
+            trigger_execution_id,
+            operation,
+            running,
+            max_running,
+            wait_secs,
+            "waiting for a running sandbox slot"
+        );
+        if let Err(error) = self
+            .store
+            .append_event(
+                protected_thread_key,
+                Some(trigger_execution_id),
+                "session.sandbox_capacity_waiting",
+                json!({
+                    "thread_key": protected_thread_key.as_str(),
+                    "execution_id": trigger_execution_id,
+                    "operation": operation,
+                    "running": running,
+                    "max_running": max_running,
+                    "wait_secs": wait_secs,
+                }),
+            )
+            .await
+        {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "sandbox_capacity_waiting_event_failed",
+                trigger_thread_key = %protected_thread_key,
+                trigger_execution_id,
+                %error,
+                "failed to record the sandbox capacity waiting event"
+            );
+        }
     }
 
     async fn ensure_running_slot(
@@ -10362,6 +10462,9 @@ mod adoption_tests {
             SandboxCapacityConfig {
                 max_running: 2,
                 hot_idle_grace: Duration::from_secs(300),
+                // This test asserts the eviction path, so it must fail at once
+                // rather than wait for a slot that never frees.
+                admission_wait: Duration::ZERO,
             },
         );
 
@@ -10399,6 +10502,93 @@ mod adoption_tests {
             event.event_type == "session.sandbox_paused"
                 && event.payload.get("reason").and_then(Value::as_str) == Some("capacity_pressure")
         }));
+    }
+
+    /// A blocked admission should wait for a slot rather than dropping the
+    /// turn. The drop is terminal -- nothing retries it and nothing surfaces on
+    /// the originating thread -- while the slot it needed usually frees seconds
+    /// later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_admission_waits_for_a_freed_running_slot() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+
+        let thread =
+            ThreadKey::parse(format!("test:capacity-wait-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let execution = store
+            .create_execution(&thread, None, json!({}))
+            .await
+            .expect("create execution");
+
+        // Two running sandboxes fill the pool with nothing evictable: the mock
+        // default is Suspended, so stale rows left by other tests skip rather
+        // than freeing a slot early and hiding the wait.
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Suspended, Vec::new()));
+        backend.set_observed_status("sbx-a", SandboxStatus::Running);
+        backend.set_observed_status("sbx-b", SandboxStatus::Running);
+
+        let controller = SandboxCapacityController::new(
+            store.clone(),
+            Arc::new(SandboxManager::new(backend.clone())),
+            Arc::new(DashMap::new()),
+            SandboxCapacityConfig {
+                max_running: 2,
+                hot_idle_grace: Duration::from_secs(300),
+                admission_wait: Duration::from_secs(30),
+            },
+        );
+
+        // A slot opens shortly after, the way the idle-pause worker frees one.
+        let releaser = backend.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(1_000)).await;
+            releaser.set_observed_status("sbx-b", SandboxStatus::Suspended);
+        });
+
+        let started = Instant::now();
+        controller
+            .run_with_capacity(
+                &thread,
+                &execution.execution.execution_id,
+                "cold_create",
+                || async { Ok(()) },
+            )
+            .await
+            .expect("admitted once a slot freed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1_000),
+            "admission should have waited rather than failing"
+        );
+
+        let events = store
+            .list_events_after(&thread, 0, None, 100)
+            .await
+            .expect("list events");
+        let waiting: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "session.sandbox_capacity_waiting")
+            .collect();
+        assert_eq!(waiting.len(), 1, "the wait is recorded exactly once");
+        assert_eq!(
+            waiting[0].payload.get("running").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            waiting[0].payload.get("operation").and_then(Value::as_str),
+            Some("cold_create")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
