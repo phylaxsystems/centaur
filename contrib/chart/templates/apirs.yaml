@@ -72,6 +72,7 @@
 {{- $apiRsEtl := .Values.apiRs.etl | default dict -}}
 {{- $companyContextEmbeddingsEnabled := dig "companyContextEmbeddings" "enabled" false $apiRsEtl -}}
 {{- $companyContextEmbeddingsModel := dig "companyContextEmbeddings" "model" "text-embedding-3-small" $apiRsEtl -}}
+{{- $companyContextEmbeddingsDimensions := dig "companyContextEmbeddings" "dimensions" 1536 $apiRsEtl -}}
 {{- $apiRsEtlEnv := list
   (dict "name" "SLACK_ETL_ENABLED" "value" (dig "slack" "enabled" false $apiRsEtl))
   (dict "name" "SLACK_SYNC_INTERVAL_SECONDS" "value" (dig "slack" "syncIntervalSeconds" 3600 $apiRsEtl))
@@ -103,6 +104,7 @@
   (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_INTERVAL_SECONDS" "value" (dig "companyContextEmbeddings" "intervalSeconds" 300 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_BATCH_SIZE" "value" (dig "companyContextEmbeddings" "batchSize" 250 $apiRsEtl))
   (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MODEL" "value" $companyContextEmbeddingsModel)
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS" "value" $companyContextEmbeddingsDimensions)
 -}}
 {{- $apiRsEtlPassthroughNames := list -}}
 {{- range $env := $apiRsEtlEnv -}}
@@ -171,10 +173,40 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: {{ $apiRsName }}
+    namespace: {{ .Release.Namespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-manager") }}
+---
+# Read-only cluster census for the paused-proxy retention sweep: it sizes
+# proxy eviction against each steering node's allocatable pod count, which
+# the namespace-scoped Role above cannot see.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-node-budget") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-node-budget") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $apiRsName }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-node-budget") }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -322,14 +354,36 @@ spec:
               value: {{ .Values.apiRs.sandboxRunningLimit | quote }}
             - name: SESSION_SANDBOX_HOT_IDLE_GRACE_SECS
               value: {{ .Values.apiRs.sandboxHotIdleGraceSecs | quote }}
+            - name: SESSION_EXECUTION_MAX_DURATION_MS
+              # int64 before quote: Helm parses a values number as float64, and
+              # `quote` on a float renders scientific notation. Any ceiling at
+              # or above a million milliseconds -- about 17 minutes, so every
+              # useful value -- would reach the container as "7.2e+06" and fail
+              # to parse as a u64, taking api-rs down with it.
+              value: {{ .Values.apiRs.executionMaxDurationMs | default 0 | int64 | quote }}
+            - name: SESSION_SANDBOX_ADMISSION_WAIT_SECS
+              value: {{ .Values.apiRs.sandboxAdmissionWaitSecs | default 600 | quote }}
+            - name: SESSION_SANDBOX_MEMORY_BUDGET_GIB
+              value: {{ .Values.apiRs.sandboxMemoryBudgetGib | default 0 | quote }}
             - name: SESSION_SANDBOX_MAX_LIFETIME_SECS
               value: {{ .Values.apiRs.sandboxMaxLifetimeSecs | quote }}
             - name: SESSION_SANDBOX_REAP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxReapIntervalSecs | quote }}
+            - name: SESSION_EVENTS_RETENTION_DAYS
+              value: {{ .Values.apiRs.sessionEventsRetentionDays | default 0 | quote }}
             - name: SESSION_SANDBOX_CLEANUP_INTERVAL_SECS
               value: {{ .Values.apiRs.sandboxCleanupIntervalSecs | quote }}
             - name: SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS
               value: {{ .Values.apiRs.sandboxIdleCleanupBackstopSecs | quote }}
+            # Paused-proxy retention sweep. api-rs needs read-only cluster
+            # pods+nodes to size proxy eviction against each node's
+            # allocatable pod count (see the ClusterRole above).
+            - name: SESSION_SANDBOX_PAUSED_PROXY_SWEEP_INTERVAL_SECS
+              value: {{ .Values.apiRs.sandboxPausedProxySweepIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_PAUSED_PROXY_MARGIN_PODS
+              value: {{ .Values.apiRs.sandboxPausedProxyMarginPods | quote }}
+            - name: SESSION_SANDBOX_PAUSED_PROXY_CAP
+              value: {{ .Values.apiRs.sandboxPausedProxyCap | quote }}
             - name: SESSION_ACTIVITY_SUMMARY_ENABLED
               value: {{ .Values.apiRs.activitySummary.enabled | quote }}
 {{- if .Values.apiRs.activitySummary.enabled }}
@@ -345,6 +399,8 @@ spec:
               value: {{ .Values.apiRs.activitySummary.maxFacts | quote }}
             - name: SESSION_ACTIVITY_SUMMARY_MAX_OUTPUT_TOKENS
               value: {{ .Values.apiRs.activitySummary.maxOutputTokens | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_REASONING_EFFORT
+              value: {{ .Values.apiRs.activitySummary.reasoningEffort | default "" | quote }}
 {{- end }}
             - name: SESSION_SANDBOX_K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}

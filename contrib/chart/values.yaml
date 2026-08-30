@@ -111,6 +111,14 @@ console:
   # service DNS names that differ from the chart's short in-cluster URL;
   # publicUrl and the short service host are already included.
   allowedHosts: []
+  # Additional hosts whose requests get the sandbox entitlements credential
+  # injected by the proxy. The in-cluster console URL is always included.
+  #
+  # Needed when sandboxes cannot reach the console's in-cluster address: they
+  # must then use another host, and without a matching injection rule that
+  # request arrives with no credential and is refused. Set this to whatever
+  # address the sandboxes actually use.
+  entitlementsHosts: []
   # Optional Sentry DSN for Console web requests and background jobs. Empty by
   # default, so the Sentry SDK remains disabled unless explicitly configured.
   sentryDsn: ""
@@ -452,6 +460,19 @@ apiRs:
   # then pausing least-recently-active idle session sandboxes. 0 disables.
   sandboxRunningLimit: 0
   sandboxHotIdleGraceSecs: 300
+  # How long an admission blocked by sandboxRunningLimit waits for a slot
+  # before failing the turn. A refused turn is terminal: nothing retries it and
+  # nothing surfaces on the originating thread, while the slot it needed
+  # usually frees seconds later. 0 fails at once.
+  sandboxAdmissionWaitSecs: 600
+  # Memory budget in GiB committed by the running session sandboxes.
+  # Admission enforces the smaller of sandboxRunningLimit and this budget
+  # divided by one sandbox's committed share (sandbox.resources.limits.memory
+  # plus the iron-proxy memory limit each sandbox schedules), and records the
+  # computation in every admission decision. Requires sandboxRunningLimit > 0
+  # and a parseable agent memory limit; a budget that cannot hold one sandbox
+  # fails startup. 0 disables memory-aware admission.
+  sandboxMemoryBudgetGib: 0
   # When true, api-rs upserts the shared iron-control infra role and its
   # backing secrets at startup and on tool-secret reconciliation intervals.
   # Set false when multiple Centaur instances share one console/1Password
@@ -510,16 +531,46 @@ apiRs:
       batchSize: 250
       # Shared by the embedding workflow and company-context searches in agent sandboxes.
       model: text-embedding-3-small
+      # Vector width requested from the model, and the width of the embedding
+      # column. The write and query sides read this same value, so changing it
+      # on a populated table means re-embedding: existing rows keep the old
+      # width and Postgres will reject the mismatch. pgvector will not build an
+      # HNSW or IVFFlat index above 2000.
+      dimensions: 1536
   # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
+  # Wall-clock ceiling for an execution whose caller sets no max_duration_ms.
+  # 0 leaves executions unbounded: a turn that keeps streaming model output
+  # never trips an idle path, so nothing stops it short of an operator. A
+  # per-request max_duration_ms always wins over this.
+  executionMaxDurationMs: 0
+  # Reaper: stop sandboxes older than the max lifetime, regardless of whether
   sandboxMaxLifetimeSecs: 259200 # 3 days
   sandboxReapIntervalSecs: 300
   # Cleanup worker: stop unreferenced session/warm-pool sandboxes after two
   # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
   # The idle backstop is only used when older execution rows have no persisted
   # idle_timeout_ms. 0 disables the corresponding arm.
+  # Delete session_events older than this many days. 0 disables retention.
+  # session_events carries one row per harness stdout line and nothing removed
+  # them, so the table grows for the life of the deployment -- order 450MB/day
+  # on a modest single node, against the 20Gi default Postgres volume below.
+  # Events of a queued or running execution are never deleted, whatever their
+  # age. Sweeps run on sandboxCleanupIntervalSecs and are bounded per pass, so
+  # a large first backlog drains over several sweeps.
+  sessionEventsRetentionDays: 0
   sandboxCleanupIntervalSecs: 300
   sandboxIdleCleanupBackstopSecs: 21600 # 6 hours
+  # Paused-proxy retention sweep: paused sandboxes keep their iron-proxy pod
+  # for fast resume, and this sweep bounds how many a node holds against its
+  # allocatable pod count, evicting the longest-paused first so new sandbox
+  # pods can always schedule. 0 on the interval disables the sweep.
+  # marginPods is the pod headroom kept free per node (a new sandbox
+  # schedules one agent pod and one proxy pod). cap is an absolute ceiling on
+  # retained proxies; 0 sizes the ceiling from node capacity alone.
+  sandboxPausedProxySweepIntervalSecs: 300
+  sandboxPausedProxyMarginPods: 2
+  sandboxPausedProxyCap: 0
   activitySummary:
     enabled: false
     model: gpt-5.4-nano
@@ -529,6 +580,11 @@ apiRs:
     timeoutSecs: 5
     maxFacts: 12
     maxOutputTokens: 128
+    # Reasoning effort for the summary call. The output budget above is small,
+    # so a server that resolves an absent effort to its highest level spends
+    # the whole budget reasoning and returns no message. Empty omits the
+    # parameter, for a server that rejects it outright.
+    reasoningEffort: low
   metrics:
     # The Rust API always serves Prometheus text metrics at /metrics. This flag
     # only controls scrape annotations for Prometheus/VictoriaMetrics-style
@@ -643,6 +699,23 @@ linearbot:
     tag: latest
     pullPolicy: Always
   userName: centaur
+  # Replaces the ownership contract linearbot injects on owned-issue turns.
+  # Supply the whole contract; it is used verbatim. Deployments that reserve
+  # terminal states for humans state their policy here, rather than
+  # counter-instructing it from the system-prompt overlay and leaving the model
+  # to reconcile two opposed instructions on every turn. Unset uses the default.
+  ownershipContext: ""
+  # Replaces the kickoff prompt used when an owned issue arrives with no
+  # instructions. Unset uses the default.
+  emptyPromptInstruction: ""
+  # Reasoning effort per turn type (codex turn/start.effort). Both unset run at
+  # the harness default. These turns are autonomous, so there is no message for
+  # a -rsn flag to ride on, and one global setting suits neither an assignment
+  # turn implementing a whole ticket nor a one-line comment reply.
+  # Accepts none | minimal | low | medium | high | xhigh | max.
+  reasoningEffort:
+    assignment: ""
+    comment: ""
   extraEnv: {}
   resources: {}
 

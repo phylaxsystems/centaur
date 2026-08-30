@@ -3,6 +3,7 @@ import { drainBackgroundWork } from "../src/context";
 import {
   decideMerge,
   handleCiEvent,
+  handlePullRequestEvent,
   handleReviewEvent,
   isOwnedPr,
   type PrManagerContext,
@@ -948,5 +949,97 @@ describe("management turn reaction ack", () => {
     await handleReviewEvent(reviewCtx(reactions), submittedReview("changes_requested"));
     await drainBackgroundWork(5_000);
     expect(reactions).toEqual([]);
+  });
+});
+
+describe("pull request closed", () => {
+  type CloseCall = { url: string; method: string; body: unknown };
+
+  function closeCtx(calls: CloseCall[], sessionsExist = true) {
+    return {
+      octokit: { rest: { pulls: { get: async () => ({ data: {} }) } } },
+      options: {
+        apiUrl: "http://localhost",
+        logger: { debug() {}, warn() {}, error() {}, info() {} },
+        fetch: async (
+          url: string,
+          init?: { body?: string; method?: string },
+        ) => {
+          const method = init?.method ?? "GET";
+          calls.push({
+            url: String(url),
+            method,
+            body: init?.body ? JSON.parse(init.body) : undefined,
+          });
+          if (method === "GET" && !sessionsExist) {
+            return new Response("not found", { status: 404 });
+          }
+          return new Response(JSON.stringify({ thread_key: "t", created: true }), {
+            headers: { "content-type": "application/json" },
+            status: 200,
+          });
+        },
+      },
+      state: makeState(),
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+  }
+
+  async function runClose(merged: boolean, sessionsExist = true) {
+    const calls: CloseCall[] = [];
+    await handlePullRequestEvent(
+      closeCtx(calls, sessionsExist),
+      JSON.stringify({
+        action: "closed",
+        pull_request: { merged, number: 41, title: "Add the thing" },
+        repository: { full_name: "base/repo" },
+      }),
+    );
+    return calls;
+  }
+
+  function appendedTexts(calls: CloseCall[]): string[] {
+    return calls
+      .filter((call) => call.url.endsWith("/messages"))
+      .flatMap((call) => {
+        const body = call.body as
+          | { messages?: { parts?: { text?: string }[] }[] }
+          | undefined;
+        return (body?.messages ?? []).flatMap((message) =>
+          (message.parts ?? []).map((part) => part.text ?? ""),
+        );
+      });
+  }
+
+  test("tells both PR-scoped threads the pull request closed", async () => {
+    const calls = await runClose(false);
+    const urls = calls.map((call) => call.url).join(" ");
+    // A close matters to the management turn and to a review-response turn;
+    // they are separate sessions and either may be mid-flight.
+    expect(urls).toContain(encodeURIComponent("github-manage:base/repo:41"));
+    expect(urls).toContain(encodeURIComponent("github-review:base/repo:41"));
+  });
+
+  test("starts no execution, so a close consumes no sandbox slot", async () => {
+    const calls = await runClose(false);
+    expect(calls.some((call) => call.url.includes("/execute"))).toBe(false);
+  });
+
+  test("does not create sessions for an unrelated closed pull request", async () => {
+    const calls = await runClose(false, false);
+    expect(calls.filter((call) => call.method === "GET")).toHaveLength(2);
+    expect(calls.some((call) => call.url.endsWith("/messages"))).toBe(false);
+    expect(calls.some((call) => call.method === "POST")).toBe(false);
+  });
+
+  test("names the outcome, because superseded and finished differ", async () => {
+    const closed = appendedTexts(await runClose(false)).join("\n");
+    expect(closed).toContain("closed without merging");
+    // The duplicate-PR failure came from a bare close reading as "start over".
+    expect(closed).toContain("do not re-open or re-implement");
+
+    const merged = appendedTexts(await runClose(true)).join("\n");
+    expect(merged).toContain("has been merged");
+    expect(merged).not.toContain("closed without merging");
   });
 });

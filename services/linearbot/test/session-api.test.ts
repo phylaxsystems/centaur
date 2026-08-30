@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   forwardToSessionApi,
   harnessRestartPreamble,
+  interruptSession,
 } from "../src/session-api";
 import type {
   ForwardSessionInput,
@@ -98,6 +99,34 @@ function isCreateRequest(request: RecordedRequest): boolean {
     !request.url.endsWith("/events")
   );
 }
+
+describe("interruptSession", () => {
+  test("posts the release reason and returns the API interruption state", async () => {
+    const requests: Array<{ body: unknown; method?: string; url: string }> = [];
+    const fetchFn = async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      requests.push({
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        method: init?.method,
+        url: String(input),
+      });
+      return Response.json({ interrupted: true });
+    };
+
+    await expect(
+      interruptSession(options(fetchFn), THREAD_ID, "issue taken back"),
+    ).resolves.toBe(true);
+    expect(requests).toEqual([
+      {
+        body: { reason: "issue taken back" },
+        method: "POST",
+        url: `http://api.test/api/session/${encodeURIComponent(THREAD_ID)}/interrupt`,
+      },
+    ]);
+  });
+});
 
 describe("forwardToSessionApi overrides", () => {
   test("creates session with default codex harness", async () => {

@@ -191,6 +191,7 @@ export async function forwardToSessionApi(
     input.model,
     input.provider,
     input.contextPreamble,
+    input.reasoning,
   );
   traceLog(options, "linearbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -222,12 +223,39 @@ export async function executeSessionTurn(
     input.model,
     input.provider,
     input.contextPreamble,
+    input.reasoning,
   );
   traceLog(options, "linearbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
     phase_ms: elapsedMs(executeStartedAtMs),
   });
   return execution;
+}
+
+/**
+ * Asks api-rs to stop the thread's active execution.
+ *
+ * Reports whether there was one to stop, which is the difference between
+ * "cancelled before it started" and "stopped mid-turn" — worth logging, since
+ * only the second leaves a half-finished thread behind.
+ */
+export async function interruptSession(
+  options: LinearbotOptions,
+  threadId: string,
+  reason: string,
+): Promise<boolean> {
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(
+    apiSessionUrl(options.apiUrl, threadId, "interrupt"),
+    {
+      method: "POST",
+      headers: apiHeaders(options),
+      body: JSON.stringify({ reason }),
+    },
+  );
+  await ensureApiOk(response, "interrupt session", options);
+  const body = (await response.json()) as { interrupted?: boolean };
+  return body.interrupted === true;
 }
 
 export async function openSessionEventStream(
@@ -512,12 +540,20 @@ async function executeSession(
   model?: string,
   provider?: string,
   contextPreamble?: string,
+  reasoning?: string,
 ): Promise<LinearbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
   const body: LinearbotExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: "execute" }),
-    input_lines: toCodexInputLines(message, threadId, model, provider, contextPreamble),
+    input_lines: toCodexInputLines(
+      message,
+      threadId,
+      model,
+      provider,
+      contextPreamble,
+      reasoning,
+    ),
     ...(options.idleTimeoutMs === undefined
       ? {}
       : { idle_timeout_ms: options.idleTimeoutMs }),
@@ -604,7 +640,7 @@ async function streamSessionNotifications(
 function apiSessionUrl(
   apiUrl: string,
   threadId: string,
-  suffix?: "messages" | "execute" | "events",
+  suffix?: "messages" | "execute" | "events" | "interrupt",
 ): string {
   const path = `/api/session/${encodeURIComponent(threadId)}${suffix ? `/${suffix}` : ""}`;
   return new URL(path, ensureTrailingSlash(apiUrl)).toString();
@@ -683,6 +719,7 @@ function toCodexInputLines(
   model?: string,
   provider?: string,
   contextPreamble?: string,
+  reasoning?: string,
 ): string[] {
   const staged = new Map<LinearbotApiAttachment, string>();
   const lines: string[] = [];
@@ -695,6 +732,7 @@ function toCodexInputLines(
       model,
       provider,
       contextPreamble,
+      reasoning,
     );
     if (
       inlineLine.length <= MAX_CODEX_INPUT_LINE_CHARS &&
@@ -714,6 +752,7 @@ function toCodexInputLines(
       model,
       provider,
       contextPreamble,
+      reasoning,
     ),
   );
   return lines;
@@ -726,6 +765,7 @@ function toCodexInputLineWithStaged(
   model?: string,
   provider?: string,
   contextPreamble?: string,
+  reasoning?: string,
 ): string {
   return JSON.stringify({
     type: "user",
@@ -733,6 +773,7 @@ function toCodexInputLineWithStaged(
     trace_metadata: sessionMetadata(message, { action: "execute" }),
     ...(model ? { model } : {}),
     ...(provider ? { provider } : {}),
+    ...(reasoning ? { reasoning } : {}),
     message: {
       role: "user",
       content: codexInputContent(message, staged, contextPreamble),

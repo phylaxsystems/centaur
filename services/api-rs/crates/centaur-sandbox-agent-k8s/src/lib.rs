@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend, SandboxError, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -29,10 +29,15 @@ use tokio::time::{Instant, sleep};
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
 pub use k8s_openapi::api::core::v1::Toleration;
+pub use paused_proxy_retention::{
+    NodePodBudget, PausedProxyRetentionConfig, PausedProxyRetentionReport,
+    PausedProxyRetentionSweep, RetainedPausedProxy, select_evictions,
+};
 pub use tools::{GitHubTokenRef, ToolSource, ToolsConfig};
 
 pub mod generated;
 mod iron_proxy;
+mod paused_proxy_retention;
 mod tools;
 
 const BACKEND_NAME: &str = "agent-sandbox-k8s";
@@ -61,6 +66,15 @@ pub struct AgentSandboxConfig {
     pub namespace: String,
     pub field_manager: String,
     pub container_name: String,
+    /// Fleet-policy resources for the agent container, as currently configured.
+    ///
+    /// The CR stores the pod template rendered at create, and every pod
+    /// recreation re-renders from that stored template, so a session created
+    /// before a resources change keeps the old limits for its whole life --
+    /// including across pod replacement. Reconciling on resume is what lets a
+    /// values change reach an existing session without destroying its CR (and
+    /// with it, its workspace).
+    pub default_resources: Option<ResourceRequirements>,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub image_pull_policy: Option<String>,
@@ -97,6 +111,10 @@ pub struct AgentSandboxConfig {
     /// the per-sandbox proxy uses this target for its own explicit egress.
     pub otlp_egress: Option<OtlpEgressTarget>,
     pub ready_timeout: Duration,
+    /// Retention policy for paused sandboxes' iron-proxy pods. The sweep
+    /// bounds how many of them a node keeps so they cannot crowd out the
+    /// agent and proxy pods new sandboxes need to schedule.
+    pub paused_proxy_retention: PausedProxyRetentionConfig,
 }
 
 /// Destination of the sandbox's direct OTLP export, expressed as the target
@@ -134,6 +152,7 @@ impl AgentSandboxConfig {
             namespace: namespace.into(),
             field_manager: "centaur-api-rs".to_owned(),
             container_name: DEFAULT_CONTAINER_NAME.to_owned(),
+            default_resources: None,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             image_pull_policy: None,
@@ -149,6 +168,7 @@ impl AgentSandboxConfig {
             tools: None,
             otlp_egress: None,
             ready_timeout: Duration::from_secs(60),
+            paused_proxy_retention: PausedProxyRetentionConfig::default(),
         }
     }
 
@@ -197,6 +217,9 @@ pub struct AgentSandboxBackend {
     // sandbox id -> iron-control proxy OID, so the proxy can be deregistered on
     // stop. Only populated for sync-mode sandboxes.
     proxy_ids: Arc<Mutex<HashMap<String, String>>>,
+    // Sandbox ids whose resume is rebuilding their proxy right now, so the
+    // paused-proxy retention sweep leaves those rebuilds alone.
+    resuming: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl AgentSandboxBackend {
@@ -205,6 +228,16 @@ impl AgentSandboxBackend {
             client,
             config,
             proxy_ids: Arc::new(Mutex::new(HashMap::new())),
+            resuming: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    /// Sandbox ids whose resume is rebuilding their proxy. The paused-proxy
+    /// retention sweep consults this so it never evicts a proxy mid-resume.
+    pub(crate) fn resuming_sandbox_ids(&self) -> BTreeSet<String> {
+        match self.resuming.lock() {
+            Ok(set) => set.clone(),
+            Err(_) => BTreeSet::new(),
         }
     }
 
@@ -243,6 +276,69 @@ impl AgentSandboxBackend {
             Err(err) if is_not_found(&err) => Ok(None),
             Err(err) => Err(map_kube_error("get sandbox", err)),
         }
+    }
+
+    /// Delete leaked iron-proxy resources on a failure path, surfacing the
+    /// result instead of discarding it. The primary error is what the caller
+    /// returns; a failed unwind is a leak the operator must see.
+    async fn unwind_iron_proxy_resources(&self, id: &SandboxId) {
+        if let Err(error) = self.delete_iron_proxy_resources(id).await {
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to unwind leaked iron-proxy resources"
+            );
+        }
+    }
+
+    /// Bring a paused sandbox's stored pod template back in line with the
+    /// currently configured agent resources.
+    ///
+    /// Only the agent container's `resources` is touched. Everything else in
+    /// the template is session identity -- harness args, env, principal
+    /// annotations -- and re-rendering it from current config would rewrite a
+    /// session's own setup underneath it.
+    ///
+    /// Runs on resume, when `replicas` is still 0 and no pod exists, so this
+    /// never restarts a running pod: the reconciled template is what the next
+    /// pod is built from.
+    async fn reconcile_sandbox_resources(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+    ) -> SandboxResult<()> {
+        let Some(desired) = self.config.default_resources.as_ref() else {
+            return Ok(());
+        };
+        if desired.is_empty() {
+            return Ok(());
+        }
+        let Some((index, desired_value)) = resources_drift(
+            &sandbox.spec.pod_template.spec.containers,
+            &self.config.container_name,
+            desired,
+        ) else {
+            return Ok(());
+        };
+        // A merge patch on `containers` would replace the whole array, so this
+        // has to be a JSON patch at the container's own index.
+        let patch = resources_json_patch(index, desired_value);
+        self.sandboxes()
+            .patch(
+                id.as_str(),
+                &PatchParams::default(),
+                &Patch::Json::<crd::Sandbox>(serde_json::from_value(patch).map_err(|err| {
+                    SandboxError::backend(format!("build resources patch: {err}"))
+                })?),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| map_kube_error("reconcile sandbox resources", err))?;
+        tracing::info!(
+            sandbox_id = id.as_str(),
+            "reconciled sandbox resources with current configuration"
+        );
+        Ok(())
     }
 
     async fn get_pod(&self, id: &SandboxId) -> SandboxResult<Option<Pod>> {
@@ -302,7 +398,8 @@ impl AgentSandboxBackend {
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
-            .with_suspended_since(sandbox_paused_at(sandbox)))
+            .with_suspended_since(sandbox_paused_at(sandbox))
+            .with_reason(pod.as_ref().and_then(pod_termination_reason)))
     }
 
     async fn patch_sandbox_merge(&self, id: &SandboxId, patch: Value) -> SandboxResult<()> {
@@ -456,18 +553,18 @@ impl SandboxBackend for AgentSandboxBackend {
             .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
             .await
         {
-            let _ = self.delete_iron_proxy_resources(&id).await;
+            self.unwind_iron_proxy_resources(&id).await;
             return Err(err);
         }
         if let Err(error) = self.create_sandbox_files_config_map(&id, &spec).await {
-            let _ = self.delete_iron_proxy_resources(&id).await;
+            self.unwind_iron_proxy_resources(&id).await;
             return Err(error);
         }
         let sandbox = match build_agent_sandbox(&id, &spec, &self.config) {
             Ok(sandbox) => sandbox,
             Err(error) => {
                 let _ = self.delete_sandbox_files_config_map(&id).await;
-                let _ = self.delete_iron_proxy_resources(&id).await;
+                self.unwind_iron_proxy_resources(&id).await;
                 return Err(error);
             }
         };
@@ -479,7 +576,7 @@ impl SandboxBackend for AgentSandboxBackend {
             Ok(created) => created,
             Err(err) => {
                 let _ = self.delete_sandbox_files_config_map(&id).await;
-                let _ = self.delete_iron_proxy_resources(&id).await;
+                self.unwind_iron_proxy_resources(&id).await;
                 return Err(map_kube_error("create sandbox", err));
             }
         };
@@ -609,6 +706,10 @@ impl SandboxBackend for AgentSandboxBackend {
             .await
     }
 
+    async fn reap_orphan_iron_proxy_resources(&self) -> SandboxResult<BTreeMap<String, u32>> {
+        self.sweep_orphan_iron_proxy_resources().await
+    }
+
     async fn ensure_iron_control_proxy_resources(
         &self,
         id: &SandboxId,
@@ -636,25 +737,49 @@ impl SandboxBackend for AgentSandboxBackend {
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
         // Resume only has the sandbox id, not the spec, so rebind the proxy to
         // the principal recorded at create rather than re-resolving from spec.
+        if let Ok(mut resuming) = self.resuming.lock() {
+            resuming.insert(id.as_str().to_owned());
+        }
+        let _resume_guard = ResumeGuard {
+            set: self.resuming.as_ref(),
+            id: id.as_str().to_owned(),
+        };
         let resolved_iron_proxy = self.resolve_iron_proxy_for_resume(id).await?;
         if let Err(err) = self
             .create_iron_proxy_resources(id, resolved_iron_proxy.as_ref())
             .await
         {
-            let _ = self.delete_iron_proxy_resources(id).await;
+            self.unwind_iron_proxy_resources(id).await;
             return Err(err);
         }
         // The proxy resources were recreated, so re-bind them to the sandbox
         // for cascade deletion.
         let sandbox = self.get_sandbox(id).await?;
         if let Some(sandbox) = &sandbox
-            && let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await
+            && let Err(error) = self.reconcile_sandbox_resources(id, sandbox).await
         {
+            // A drifted limit is worse than a stale one only if it stops the
+            // resume, so this warns rather than failing the turn.
             tracing::warn!(
                 sandbox_id = id.as_str(),
                 %error,
-                "failed to set ownerReferences on resumed iron-proxy resources"
+                "failed to reconcile sandbox resources with current configuration"
             );
+        }
+        match &sandbox {
+            Some(sandbox) => {
+                if let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await {
+                    tracing::warn!(
+                        sandbox_id = id.as_str(),
+                        %error,
+                        "failed to set ownerReferences on resumed iron-proxy resources"
+                    );
+                }
+            }
+            None => tracing::warn!(
+                sandbox_id = id.as_str(),
+                "sandbox CR missing during resume; recreated iron-proxy resources are unowned"
+            ),
         }
         // A pod that was deleted out from under a `Suspended`/`Created`
         // sandbox (janitor, node pressure, manual reap) comes back through
@@ -673,6 +798,21 @@ impl SandboxBackend for AgentSandboxBackend {
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
         self.wait_until_running(id).await
+    }
+}
+
+/// Clears the in-resume mark when a resume attempt ends, whatever its
+/// outcome, so the paused-proxy retention sweep evicts it again.
+struct ResumeGuard<'a> {
+    set: &'a std::sync::Mutex<BTreeSet<String>>,
+    id: String,
+}
+
+impl Drop for ResumeGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.id);
+        }
     }
 }
 
@@ -760,7 +900,11 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
     // The backing Pod Ready condition is the attach boundary; phase alone can be Running while
     // the sandbox is still not ready for I/O.
     let Some(pod) = pod else {
-        return SandboxStatus::Created;
+        // The CR asks for a replica and there is no Pod behind it. Reporting
+        // this as Created made it indistinguishable from a sandbox still
+        // coming up, so it consumed a running slot that nothing could ever
+        // return.
+        return SandboxStatus::Vacant;
     };
     if pod.metadata.deletion_timestamp.is_some() {
         return SandboxStatus::Created;
@@ -779,6 +923,36 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
         "unknown" => SandboxStatus::Unknown("unknown".to_owned()),
         other => SandboxStatus::Unknown(other.to_owned()),
     }
+}
+
+/// Why the sandbox's container died, when the pod still records it.
+///
+/// A sandbox killed by the kubelet reports the same "stdout closed" symptom as
+/// every other death, so without this the cause is invisible unless an operator
+/// reads pod status before the pod is collected. `OOMKilled` and `Evicted` are
+/// the ones worth naming: they are capacity problems, not harness problems, and
+/// they are actionable in a way a generic io failure is not.
+///
+/// The current `state` is preferred over `last_state`: a container that has
+/// just terminated carries the reason there, and `last_state` holds the
+/// previous run once the kubelet restarts it. The pod-level `reason` covers
+/// eviction, where the container may never report one.
+fn pod_termination_reason(pod: &Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    let from_container = status
+        .container_statuses
+        .iter()
+        .flatten()
+        .find_map(|container| {
+            let terminated = |state: &Option<k8s_openapi::api::core::v1::ContainerState>| {
+                state
+                    .as_ref()
+                    .and_then(|state| state.terminated.as_ref())
+                    .and_then(|terminated| terminated.reason.clone())
+            };
+            terminated(&container.state).or_else(|| terminated(&container.last_state))
+        });
+    from_container.or_else(|| status.reason.clone())
 }
 
 fn pod_ready(pod: &Pod) -> bool {
@@ -1150,6 +1324,36 @@ fn sandbox_owner_reference(sandbox: &crd::Sandbox) -> Option<Value> {
         "name": name,
         "uid": uid,
     }))
+}
+
+/// The agent container's index and the desired resources value, when the
+/// stored template has drifted from current configuration.
+///
+/// `None` means nothing to do: no container of that name (do not guess at an
+/// index), or the stored resources already match. Returning the index rather
+/// than patching here keeps the decision testable without a cluster.
+fn resources_drift(
+    containers: &[crd::SandboxPodTemplateSpecContainers],
+    container_name: &str,
+    desired: &ResourceRequirements,
+) -> Option<(usize, Value)> {
+    let index = containers
+        .iter()
+        .position(|container| container.name == container_name)?;
+    let current = serde_json::to_value(&containers[index].resources).unwrap_or(Value::Null);
+    let desired_value = json!(desired);
+    (current != desired_value).then_some((index, desired_value))
+}
+
+/// JSON Patch `add` both creates an absent object member and replaces an
+/// existing one. `replace` cannot fill a container whose serialized template
+/// omitted `resources`, which is exactly one of the drift cases above.
+fn resources_json_patch(index: usize, desired_value: Value) -> Value {
+    json!([{
+        "op": "add",
+        "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
+        "value": desired_value,
+    }])
 }
 
 fn resources_json(spec: &SandboxSpec) -> Option<Value> {
@@ -1837,7 +2041,10 @@ mod tests {
             sandbox_status_from_pod(1, Some(&unready_pod)),
             SandboxStatus::Created
         );
-        assert_eq!(sandbox_status_from_pod(1, None), SandboxStatus::Created);
+        // A CR asking for a replica with no Pod behind it is vacant, not
+        // starting. Reporting Created here is what let a pod-less CR hold a
+        // running slot nothing could return.
+        assert_eq!(sandbox_status_from_pod(1, None), SandboxStatus::Vacant);
 
         let failed_pod = pod_with_phase_and_ready("Failed", false);
         assert_eq!(
@@ -1867,5 +2074,137 @@ mod tests {
             }),
             ..Pod::default()
         }
+    }
+
+    fn terminated_pod(
+        state: Option<&str>,
+        last_state: Option<&str>,
+        pod_reason: Option<&str>,
+    ) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus,
+        };
+        let terminated = |reason: Option<&str>| {
+            reason.map(|reason| ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    reason: Some(reason.to_owned()),
+                    ..ContainerStateTerminated::default()
+                }),
+                ..ContainerState::default()
+            })
+        };
+        Pod {
+            status: Some(PodStatus {
+                phase: Some("Failed".to_owned()),
+                reason: pod_reason.map(str::to_owned),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "agent".to_owned(),
+                    state: terminated(state),
+                    last_state: terminated(last_state),
+                    ..ContainerStatus::default()
+                }]),
+                ..PodStatus::default()
+            }),
+            ..Pod::default()
+        }
+    }
+
+    #[test]
+    fn termination_reason_reads_the_current_terminated_state() {
+        let pod = terminated_pod(Some("OOMKilled"), None, None);
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("OOMKilled"));
+    }
+
+    /// Once the kubelet restarts a container the cause moves to `last_state`,
+    /// so a restarted OOM must still name itself.
+    #[test]
+    fn termination_reason_falls_back_to_last_state() {
+        let pod = terminated_pod(None, Some("OOMKilled"), None);
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("OOMKilled"));
+    }
+
+    /// An evicted pod may carry no container state at all; the reason is on
+    /// the pod.
+    #[test]
+    fn termination_reason_falls_back_to_the_pod_reason() {
+        let pod = terminated_pod(None, None, Some("Evicted"));
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("Evicted"));
+    }
+
+    #[test]
+    fn termination_reason_is_absent_for_a_healthy_pod() {
+        assert_eq!(
+            pod_termination_reason(&pod_with_phase_and_ready("Running", true)),
+            None
+        );
+    }
+
+    fn container_with_resources(
+        name: &str,
+        memory: Option<&str>,
+    ) -> crd::SandboxPodTemplateSpecContainers {
+        let resources = memory.map(|memory| {
+            serde_json::from_value(json!({ "limits": { "memory": memory } })).expect("resources")
+        });
+        crd::SandboxPodTemplateSpecContainers {
+            name: name.to_owned(),
+            resources,
+            ..serde_json::from_value(json!({ "name": name })).expect("container")
+        }
+    }
+
+    fn desired_memory(memory: &str) -> ResourceRequirements {
+        let mut requirements = ResourceRequirements::new();
+        requirements
+            .limits
+            .insert("memory".to_owned(), memory.to_owned());
+        requirements
+    }
+
+    #[test]
+    fn resources_drift_reports_the_agent_container_when_stale() {
+        let containers = vec![
+            container_with_resources("init", Some("1Gi")),
+            container_with_resources("agent", Some("24Gi")),
+        ];
+        let (index, value) =
+            resources_drift(&containers, "agent", &desired_memory("32Gi")).expect("drift");
+        // The agent container is not index 0, so the index has to come from
+        // the name rather than being assumed.
+        assert_eq!(index, 1);
+        assert_eq!(value["limits"]["memory"], "32Gi");
+    }
+
+    #[test]
+    fn resources_drift_is_none_when_already_current() {
+        let containers = vec![container_with_resources("agent", Some("32Gi"))];
+        assert!(resources_drift(&containers, "agent", &desired_memory("32Gi")).is_none());
+    }
+
+    /// Guessing an index would rewrite whichever container happened to sit
+    /// there, so an unrecognised name means leave the CR alone.
+    #[test]
+    fn resources_drift_is_none_without_a_matching_container() {
+        let containers = vec![container_with_resources("sidecar", Some("1Gi"))];
+        assert!(resources_drift(&containers, "agent", &desired_memory("32Gi")).is_none());
+    }
+
+    #[test]
+    fn resources_drift_fills_in_a_container_that_has_none() {
+        let containers = vec![container_with_resources("agent", None)];
+        let (index, value) =
+            resources_drift(&containers, "agent", &desired_memory("32Gi")).expect("drift");
+        assert_eq!(index, 0);
+        assert_eq!(value["limits"]["memory"], "32Gi");
+    }
+
+    #[test]
+    fn resources_patch_adds_an_absent_resources_member() {
+        let patch = resources_json_patch(2, json!({ "limits": { "memory": "32Gi" } }));
+        assert_eq!(patch[0]["op"], "add");
+        assert_eq!(
+            patch[0]["path"],
+            "/spec/podTemplate/spec/containers/2/resources"
+        );
     }
 }

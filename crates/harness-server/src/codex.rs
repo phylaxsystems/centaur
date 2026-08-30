@@ -608,7 +608,7 @@ impl CodexJsonRpcChild {
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
-            if notification_method(&value).is_some() {
+            if notification_method(&value).is_some_and(should_forward_notification) {
                 write_value(stdout, &value)?;
             }
         }
@@ -869,19 +869,62 @@ fn retry_backoff(retry: u32) -> Duration {
     Duration::from_millis((500u64 << shift).min(5_000))
 }
 
+/// Extra error-message substrings a deployment considers retriable, from
+/// `CODEX_ENGINE_RETRY_PATTERNS` (comma-separated). Empty by default, so
+/// behaviour is unchanged unless a deployment opts in.
+///
+/// The built-in set below covers codex's own engine-registration failures. It
+/// cannot cover the transient failures of an arbitrary inference endpoint, and
+/// a deployment that hits one today has no lever short of patching this binary
+/// -- for example an OpenAI-compatible server rejecting a request body it could
+/// not parse, which is a framing failure that succeeds on resubmission.
+fn configured_retry_patterns() -> Vec<String> {
+    parse_retry_patterns(env::var("CODEX_ENGINE_RETRY_PATTERNS").ok().as_deref())
+}
+
+fn parse_retry_patterns(raw: Option<&str>) -> Vec<String> {
+    raw.map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .map(|pattern| pattern.to_lowercase())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// True for codex's transient "engine warming up" failure, which surfaces as a
 /// -32602 error notification (`willRetry:false`) whose message ends in
 /// "...status 404 Not Found: Engine not found". These resolve on resubmission;
 /// other -32602s (genuine invalid params) are left untouched.
+///
+/// Retries are bounded by `CODEX_ENGINE_RETRY_MAX` and only reached before the
+/// turn has streamed any output, so a pattern that turns out to match a
+/// deterministic failure costs a few resubmissions and then fails exactly as it
+/// does today.
 fn is_retriable_engine_error(value: &Value) -> bool {
+    is_retriable_error_message(value, &configured_retry_patterns())
+}
+
+fn is_retriable_error_message(value: &Value, extra_patterns: &[String]) -> bool {
     let Some(message) = value
         .pointer("/params/error/message")
         .and_then(Value::as_str)
     else {
         return false;
     };
-    message.contains("Engine not found")
+    if message.contains("Engine not found")
         || (message.contains("Job registration failed") && message.contains("404"))
+    {
+        return true;
+    }
+    if extra_patterns.is_empty() {
+        return false;
+    }
+    let message = message.to_lowercase();
+    extra_patterns
+        .iter()
+        .any(|pattern| message.contains(pattern.as_str()))
 }
 
 /// True for a `thread/status/changed` notification reporting a `systemError`.
@@ -910,6 +953,22 @@ fn notification_method(value: &Value) -> Option<&str> {
         return None;
     }
     value.get("method").and_then(Value::as_str)
+}
+
+/// Codex app-server notifications that reach no consumer and so should not be
+/// forwarded onto the blocks stream.
+///
+/// Forwarding is otherwise verbatim, because the wire contract clients parse
+/// (see `packages/harness-events`) is the codex notification shape. That makes
+/// this a deny list rather than an allow list: dropping an unrecognised method
+/// would silently break a client that does understand it.
+///
+/// `account/rateLimits/updated` is the case that earns the list. Nothing in
+/// this crate or in `packages/harness-events` names it, every field arrives
+/// null, and it repeats across every pod, so its only effect is volume on a
+/// stream that is also the sandbox's container log.
+fn should_forward_notification(method: &str) -> bool {
+    method != "account/rateLimits/updated"
 }
 
 fn error_notification_will_retry(value: &Value) -> bool {
@@ -1214,5 +1273,91 @@ mod tests {
         });
         assert!(!is_terminal_notification(&retryable, "thread-1", "turn-1"));
         assert!(is_terminal_notification(&exhausted, "thread-1", "turn-1"));
+    }
+
+    #[test]
+    fn rate_limit_notifications_are_not_forwarded() {
+        assert!(!should_forward_notification("account/rateLimits/updated"));
+    }
+
+    /// The wire contract clients parse is the codex notification shape, so the
+    /// filter is a deny list: anything it does not name keeps flowing, including
+    /// methods this build has never seen.
+    #[test]
+    fn other_notifications_still_forward() {
+        for method in [
+            "item/reasoning/textDelta",
+            "item/reasoning/summaryTextDelta",
+            "turn/completed",
+            "remoteControl/status/changed",
+            "some/method/added/after/this/build",
+        ] {
+            assert!(
+                should_forward_notification(method),
+                "{method} should still forward"
+            );
+        }
+    }
+
+    /// The reported failure: an OpenAI-compatible endpoint rejecting a request
+    /// body it could not parse. The 400 comes back in milliseconds with no work
+    /// done, and the same turn succeeds on resubmission.
+    fn malformed_request_error() -> Value {
+        json!({
+            "method": "error",
+            "params": {
+                "error": {
+                    "code": -32602,
+                    "message": "Unterminated string starting at: line 1 column 9 (char 8)"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn configured_patterns_are_off_by_default() {
+        // Unchanged behaviour unless a deployment opts in.
+        assert!(!is_retriable_error_message(&malformed_request_error(), &[]));
+        assert!(is_retriable_error_message(&engine_error(), &[]));
+    }
+
+    #[test]
+    fn configured_patterns_extend_the_builtin_set() {
+        let patterns = parse_retry_patterns(Some("unterminated string"));
+        assert!(is_retriable_error_message(
+            &malformed_request_error(),
+            &patterns
+        ));
+        // The built-ins still match with extras configured.
+        assert!(is_retriable_error_message(&engine_error(), &patterns));
+    }
+
+    #[test]
+    fn configured_patterns_match_case_insensitively() {
+        let patterns = parse_retry_patterns(Some("UNTERMINATED String"));
+        assert!(is_retriable_error_message(
+            &malformed_request_error(),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn configured_patterns_do_not_match_unrelated_errors() {
+        let patterns = parse_retry_patterns(Some("unterminated string"));
+        let unrelated = json!({
+            "method": "error",
+            "params": { "error": { "code": -32602, "message": "invalid model" } }
+        });
+        assert!(!is_retriable_error_message(&unrelated, &patterns));
+    }
+
+    #[test]
+    fn retry_patterns_parse_ignores_blanks_and_whitespace() {
+        assert_eq!(parse_retry_patterns(None), Vec::<String>::new());
+        assert_eq!(parse_retry_patterns(Some("  ,, ")), Vec::<String>::new());
+        assert_eq!(
+            parse_retry_patterns(Some(" a , B ,, c ")),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
     }
 }

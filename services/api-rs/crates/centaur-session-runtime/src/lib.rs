@@ -66,6 +66,10 @@ const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
 const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const STDOUT_OWNER_LEASE: Duration = Duration::from_secs(45);
+/// How long a blocked admission sleeps between slot re-checks. Short enough
+/// that a freed slot is taken promptly, long enough not to spin the backend's
+/// observe call.
+const ADMISSION_WAIT_TICK: Duration = Duration::from_secs(2);
 const STDOUT_OWNER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const EXECUTION_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const EXECUTION_HANDOFF_DB_TIMEOUT: Duration = Duration::from_secs(5);
@@ -155,17 +159,44 @@ pub struct SessionRuntime {
     /// so an execution cannot start on a control plane that is about to
     /// exit and release its leases.
     shutting_down: Arc<AtomicBool>,
+    /// Deployment-wide wall-clock ceiling applied when a request carries no
+    /// `max_duration_ms` of its own. `None` preserves unbounded behaviour.
+    default_max_duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct SandboxCapacityConfig {
     pub max_running: usize,
     pub hot_idle_grace: Duration,
+    /// How long a blocked admission waits for a running slot before failing
+    /// with `CapacityExceeded`. Zero fails at once, which is the behaviour
+    /// before this existed.
+    pub admission_wait: Duration,
+    /// Node memory budget in bytes committed to running session sandboxes.
+    /// `None` keeps admission count-only.
+    pub memory_budget_bytes: Option<u64>,
+    /// Memory in bytes one admitted sandbox commits: its agent container
+    /// limit plus the iron-proxy limit it schedules beside it.
+    pub per_sandbox_memory_bytes: Option<u64>,
 }
 
 impl SandboxCapacityConfig {
     pub fn is_enabled(&self) -> bool {
         self.max_running > 0
+    }
+
+    /// Running-sandbox count admission holds: the count limit intersected
+    /// with the memory budget. An unset budget or per-sandbox size leaves
+    /// the count limit in force; the budget is inert then by design, not
+    /// mis-sized.
+    pub fn admission_limit(&self) -> usize {
+        let (Some(budget), Some(per)) = (self.memory_budget_bytes, self.per_sandbox_memory_bytes)
+        else {
+            return self.max_running;
+        };
+        let per = per.max(1);
+        let from_budget = usize::try_from(budget / per).unwrap_or(usize::MAX);
+        self.max_running.min(from_budget)
     }
 }
 
@@ -490,10 +521,123 @@ impl SandboxCapacityController {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, SessionRuntimeError>>,
     {
-        let _guard = self.lock.lock().await;
-        self.ensure_running_slot(protected_thread_key, trigger_execution_id, operation)
-            .await?;
-        action().await
+        let deadline = Instant::now() + self.config.admission_wait;
+        let mut recorded_wait = false;
+        loop {
+            let guard = self.lock.lock().await;
+            match self
+                .ensure_running_slot(protected_thread_key, trigger_execution_id, operation)
+                .await
+            {
+                Ok(()) => return action().await,
+                Err(error @ SessionRuntimeError::CapacityExceeded { .. }) => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    if !recorded_wait {
+                        self.record_capacity_waiting(
+                            protected_thread_key,
+                            trigger_execution_id,
+                            &error,
+                            deadline,
+                        )
+                        .await;
+                        recorded_wait = true;
+                    }
+                    // Release the admission lock while sleeping. Holding it
+                    // would head-of-line every other turn behind this one,
+                    // including the ones whose completion frees the slot it is
+                    // waiting for. Re-taking it per attempt keeps admission
+                    // atomic, so the cap is still never exceeded.
+                    drop(guard);
+                    sleep(ADMISSION_WAIT_TICK).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Record the durable "waiting for a sandbox slot" state once per blocked
+    /// admission. A failed append must not fail the wait: losing the event
+    /// costs visibility, losing the turn costs the work.
+    async fn record_capacity_waiting(
+        &self,
+        protected_thread_key: &ThreadKey,
+        trigger_execution_id: &str,
+        error: &SessionRuntimeError,
+        deadline: Instant,
+    ) {
+        let SessionRuntimeError::CapacityExceeded {
+            max_running,
+            admission_limit,
+            running,
+            memory_budget_bytes,
+            per_sandbox_memory_bytes,
+            operation,
+        } = error
+        else {
+            return;
+        };
+        let wait_secs = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let running_memory_bytes =
+            per_sandbox_memory_bytes.and_then(|per| per.checked_mul(*running as u64));
+        let memory_headroom_bytes = match (
+            memory_budget_bytes,
+            per_sandbox_memory_bytes,
+            running_memory_bytes,
+        ) {
+            (Some(budget), Some(per), Some(running_memory)) => {
+                Some(budget.saturating_sub(running_memory).saturating_sub(*per))
+            }
+            _ => None,
+        };
+        info!(
+            component = COMPONENT_SESSION_RUNTIME,
+            event = "sandbox_capacity_waiting",
+            trigger_thread_key = %protected_thread_key,
+            trigger_execution_id,
+            operation,
+            running,
+            max_running,
+            admission_limit,
+            memory_budget_bytes,
+            per_sandbox_memory_bytes,
+            running_memory_bytes,
+            memory_headroom_bytes,
+            wait_secs,
+            "waiting for a running sandbox slot"
+        );
+        if let Err(error) = self
+            .store
+            .append_event(
+                protected_thread_key,
+                Some(trigger_execution_id),
+                "session.sandbox_capacity_waiting",
+                json!({
+                    "thread_key": protected_thread_key.as_str(),
+                    "execution_id": trigger_execution_id,
+                    "operation": operation,
+                    "running": running,
+                    "max_running": max_running,
+                    "admission_limit": admission_limit,
+                    "memory_budget_bytes": memory_budget_bytes,
+                    "per_sandbox_memory_bytes": per_sandbox_memory_bytes,
+                    "running_memory_bytes": running_memory_bytes,
+                    "memory_headroom_bytes": memory_headroom_bytes,
+                    "wait_secs": wait_secs,
+                }),
+            )
+            .await
+        {
+            warn!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "sandbox_capacity_waiting_event_failed",
+                trigger_thread_key = %protected_thread_key,
+                trigger_execution_id,
+                %error,
+                "failed to record the sandbox capacity waiting event"
+            );
+        }
     }
 
     async fn ensure_running_slot(
@@ -502,12 +646,13 @@ impl SandboxCapacityController {
         trigger_execution_id: &str,
         operation: &'static str,
     ) -> Result<(), SessionRuntimeError> {
+        let limit = self.config.admission_limit();
         let running = self.running_slot_count().await?;
-        if running < self.config.max_running {
+        if running < limit {
             return Ok(());
         }
 
-        let mut slots_needed = running.saturating_sub(self.config.max_running) + 1;
+        let mut slots_needed = running.saturating_sub(limit) + 1;
         let mut stopped_warm = 0usize;
         let mut paused_idle = 0usize;
         let mut stale_candidates_reconciled = 0usize;
@@ -633,9 +778,16 @@ impl SandboxCapacityController {
                 operation,
                 running_before = running,
                 max_running = self.config.max_running,
+                admission_limit = limit,
                 stopped_warm,
                 paused_idle,
                 stale_candidates_reconciled,
+                memory_budget_bytes = self.config.memory_budget_bytes,
+                per_sandbox_memory_bytes = self.config.per_sandbox_memory_bytes,
+                running_memory_bytes = self.config
+                    .per_sandbox_memory_bytes
+                    .and_then(|per| per.checked_mul(running as u64)),
+                memory_headroom_bytes = self.memory_headroom_for_next(running),
                 "admitted sandbox operation under capacity pressure"
             );
             return Ok(());
@@ -643,9 +795,21 @@ impl SandboxCapacityController {
 
         Err(SessionRuntimeError::CapacityExceeded {
             max_running: self.config.max_running,
+            admission_limit: limit,
             running,
+            memory_budget_bytes: self.config.memory_budget_bytes,
+            per_sandbox_memory_bytes: self.config.per_sandbox_memory_bytes,
             operation,
         })
+    }
+
+    /// Budget left for one more sandbox: the memory budget minus what the
+    /// running sandboxes commit and what the admitted one would commit.
+    fn memory_headroom_for_next(&self, running: usize) -> Option<u64> {
+        let budget = self.config.memory_budget_bytes?;
+        let per = self.config.per_sandbox_memory_bytes?;
+        let committed = per.checked_mul(running as u64)?;
+        Some(budget.saturating_sub(committed).saturating_sub(per))
     }
 
     async fn pause_capacity_candidate(
@@ -657,7 +821,15 @@ impl SandboxCapacityController {
     ) -> Result<CapacityCandidateAction, SessionRuntimeError> {
         let id = SandboxId::new(candidate.sandbox_id.as_str());
         match self.manager.status(&id).await {
-            Ok(SandboxStatus::Running | SandboxStatus::Created | SandboxStatus::Unknown(_)) => {}
+            // Vacant falls through to the pause below: the pod is already
+            // gone, but the record still requests one, so pausing is what
+            // makes the CR agree with reality.
+            Ok(
+                SandboxStatus::Running
+                | SandboxStatus::Created
+                | SandboxStatus::Vacant
+                | SandboxStatus::Unknown(_),
+            ) => {}
             Ok(SandboxStatus::Suspended) => {
                 return Ok(CapacityCandidateAction::Skipped);
             }
@@ -860,6 +1032,7 @@ impl SessionRuntime {
             capacity: None,
             stdout_owner_id: format!("api-rs-{}", uuid::Uuid::new_v4().simple()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            default_max_duration_ms: None,
         }
     }
 
@@ -1424,6 +1597,25 @@ impl SessionRuntime {
 
     /// Spawn the background reaper that stops sandboxes whose total lifetime
     /// expired. No-op when max-lifetime reaping is disabled.
+    /// Wall-clock ceiling for executions whose request does not set one.
+    ///
+    /// The watchdog, its distinct `max_duration_ms` failure, and its re-arming
+    /// after adoption all already exist; they were simply never armed for a
+    /// surface turn, because every caller treats `max_duration_ms` as optional
+    /// and nothing supplied a fallback. A streaming turn therefore had no
+    /// ceiling at all: output keeps arriving, so no idle path ever fires.
+    pub fn with_default_max_duration_ms(mut self, max_duration_ms: Option<u64>) -> Self {
+        self.default_max_duration_ms = max_duration_ms.filter(|value| *value > 0);
+        self
+    }
+
+    /// Applies the deployment default to a request that set no ceiling of its
+    /// own. A per-request `max_duration_ms` always wins, including one shorter
+    /// than the default.
+    fn with_default_max_duration(&self, input: ExecuteSessionInput) -> ExecuteSessionInput {
+        apply_default_max_duration(input, self.default_max_duration_ms)
+    }
+
     pub fn with_sandbox_reaper(self, config: SandboxReaperConfig) -> Self {
         if !config.is_enabled() {
             return self;
@@ -1964,7 +2156,7 @@ impl SessionRuntime {
             input_lines,
             idle_timeout_ms,
             max_duration_ms,
-        } = input;
+        } = self.with_default_max_duration(input);
         let input_line_count = input_lines.len();
         let idempotency_key_present = idempotency_key.is_some();
         let span = info_span!(
@@ -2235,6 +2427,7 @@ impl SessionRuntime {
             return Err(SessionRuntimeError::ShuttingDown);
         }
         self.store.get_session(thread_key).await?;
+        let input = self.with_default_max_duration(input);
         validate_input_lines(&input.input_lines)?;
         let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
 
@@ -3585,23 +3778,6 @@ impl SessionRuntime {
             return Ok(OrphanAdoption::Failed);
         };
         let id = SandboxId::new(sandbox_id);
-        let status = match self.sandbox_runtime.manager.status(&id).await {
-            Ok(status) => status,
-            Err(SandboxError::NotFound(_)) => SandboxStatus::Gone,
-            // Transient status failures must not fail a possibly live
-            // execution; surface the error and retry on the next startup.
-            Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
-        };
-        if !status.can_open_io() {
-            self.fail_orphaned_execution(
-                thread_key,
-                execution_id,
-                sandbox_id,
-                &format!("sandbox no longer accepts io (status {status:?})"),
-            )
-            .await;
-            return Ok(OrphanAdoption::Failed);
-        }
         if !self.claim_expired_stdout_owner(execution_id).await? {
             // Deferrals repeat on every periodic scan while another control
             // plane pumps the execution; only the first observation is worth
@@ -3660,6 +3836,10 @@ impl SessionRuntime {
             Ok(lines) => lines,
             Err(SandboxError::Unsupported { .. }) => Vec::new(),
             Err(error) => {
+                // Transient read failure. The recorded output is the only
+                // source of truth once the container terminalized, so
+                // swallowing it here would fail live turns; release the
+                // claim and let the next scan retry the read.
                 warn!(
                     component = COMPONENT_SESSION_RUNTIME,
                     event = "execution_adoption_log_read_failed",
@@ -3667,11 +3847,41 @@ impl SessionRuntime {
                     execution_id,
                     sandbox_id,
                     %error,
-                    "failed to read recorded sandbox output; adopting live"
+                    "failed to read recorded sandbox output; releasing claim, retrying on the next scan"
                 );
-                Vec::new()
+                let _ = self
+                    .store
+                    .release_stdout_owner(execution_id, &self.stdout_owner_id)
+                    .await;
+                if let Some(span) = self.execution_spans.lock().await.remove(execution_id) {
+                    finish_execution_trace_span(&span, "retrying");
+                }
+                return Err(SessionRuntimeError::Sandbox(error));
             }
         };
+        // Observe rather than only reading status: a sandbox the kubelet killed
+        // carries its cause on the pod, and that pod is usually collected before
+        // anyone reads the failed execution, so the reason has to be captured
+        // here, at the moment we give up on it.
+        let observed = match self.sandbox_runtime.manager.observe(&id).await {
+            Ok(observed) => Some(observed),
+            Err(SandboxError::NotFound(_)) => None,
+            Err(error) => {
+                // Transient status failures must not fail a possibly live
+                // execution; release the claim and retry on the next scan.
+                let _ = self
+                    .store
+                    .release_stdout_owner(execution_id, &self.stdout_owner_id)
+                    .await;
+                if let Some(span) = self.execution_spans.lock().await.remove(execution_id) {
+                    finish_execution_trace_span(&span, "retrying");
+                }
+                return Err(SessionRuntimeError::Sandbox(error));
+            }
+        };
+        let status = observed
+            .as_ref()
+            .map_or(SandboxStatus::Gone, |observed| observed.status.clone());
         if let Some(terminal) = terminal_output_from_lines(&lines) {
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
@@ -3700,6 +3910,50 @@ impl SessionRuntime {
             )
             .await?;
             return Ok(OrphanAdoption::Adopted);
+        }
+
+        if !status.can_open_io() {
+            // No terminal in the recorded output and no live sandbox to
+            // reattach to. A young non-terminal sandbox may still be
+            // coming up (or the status read is transient): retry on the
+            // next scan instead of failing the turn.
+            let running_since = execution.started_at.unwrap_or(execution.created_at);
+            let age = SystemTime::now()
+                .duration_since(SystemTime::from(running_since))
+                .unwrap_or_default();
+            if !status.is_terminal() && age < PRE_SANDBOX_ORPHAN_GRACE {
+                let _ = self
+                    .store
+                    .release_stdout_owner(execution_id, &self.stdout_owner_id)
+                    .await;
+                if let Some(span) = self.execution_spans.lock().await.remove(execution_id) {
+                    finish_execution_trace_span(&span, "skipped");
+                }
+                debug!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "execution_adoption_skipped",
+                    thread_key = %thread_key,
+                    execution_id,
+                    sandbox_id,
+                    ?status,
+                    age_ms = duration_millis_u64(age),
+                    "skipping young execution with a sandbox not yet open for io"
+                );
+                return Ok(OrphanAdoption::Skipped);
+            }
+            self.fail_orphaned_execution(
+                thread_key,
+                execution_id,
+                sandbox_id,
+                &sandbox_not_openable_detail(
+                    &status,
+                    observed
+                        .as_ref()
+                        .and_then(|observed| observed.reason.as_deref()),
+                ),
+            )
+            .await;
+            return Ok(OrphanAdoption::Failed);
         }
 
         // No terminal in the recorded output: treat the turn as still in
@@ -4447,22 +4701,33 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
                 }
             };
 
-            if recover_detached_terminal_output(&ctx, &thread_key, &sandbox_id, &execution)
-                .await
-                .unwrap_or_else(|error| {
-                    warn!(
-                        component = COMPONENT_SESSION_RUNTIME,
-                        event = "session_stdout_recovery_failed",
-                        thread_key = %thread_key,
-                        sandbox_id = %sandbox_id,
-                        execution_id = %execution.execution_id,
-                        %error,
-                        "failed to recover detached stdout from recorded output"
-                    );
-                    false
-                })
-            {
-                break;
+            // The container may have terminalized while the attach stream
+            // was gone: the recorded output then holds the turn's outcome,
+            // and a live reattach against a terminal sandbox can only fail
+            // the turn. Retry the read on transient failure (bounded, so a
+            // dead backend cannot stall the loop) before falling back to
+            // the live reattach.
+            for _ in 0..SESSION_PIPE_MAX_REATTACH_ATTEMPTS {
+                match recover_detached_terminal_output(&ctx, &thread_key, &sandbox_id, &execution)
+                    .await
+                {
+                    Ok(true) => break 'pump,
+                    Ok(false) => break,
+                    Err(error) => {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_stdout_recovery_failed",
+                            thread_key = %thread_key,
+                            sandbox_id = %sandbox_id,
+                            execution_id = %execution.execution_id,
+                            %error,
+                            "failed to recover detached stdout from recorded output; retrying before live reattach"
+                        );
+                        last_reattach_detail =
+                            format!("recorded sandbox output unreadable: {error}");
+                        sleep(SESSION_PIPE_REATTACH_DELAY).await;
+                    }
+                }
             }
 
             if lines_pumped > 0 {
@@ -4567,8 +4832,8 @@ async fn reattach_session_pipe(
     }
 
     let id = SandboxId::new(sandbox_id);
-    match ctx.manager.status(&id).await {
-        Ok(status) if status.can_open_io() => match ctx.manager.open_io(&id).await {
+    match ctx.manager.observe(&id).await {
+        Ok(observed) if observed.status.can_open_io() => match ctx.manager.open_io(&id).await {
             Ok(io) => {
                 let parts = io.into_parts();
                 let new_pipe = session_pipe_from_stdin(parts.stdin);
@@ -4585,9 +4850,10 @@ async fn reattach_session_pipe(
                 ReattachOutcome::Retryable(format!("sandbox stdout reattach failed: {error}"))
             }
         },
-        Ok(status) => {
-            ReattachOutcome::Dead(format!("sandbox no longer accepts io (status {status:?})"))
-        }
+        Ok(observed) => ReattachOutcome::Dead(sandbox_dead_detail(
+            &observed.status,
+            observed.reason.as_deref(),
+        )),
         Err(SandboxError::NotFound(_)) => {
             ReattachOutcome::Dead("sandbox no longer exists".to_owned())
         }
@@ -4611,6 +4877,11 @@ async fn recover_detached_terminal_output(
         Ok(lines) => lines,
         Err(SandboxError::Unsupported { .. }) => return Ok(false),
         Err(error) => {
+            // Transient read failures surface to the pump loop, which
+            // retries before falling back to a live reattach; returning
+            // Ok(false) here would reattach against a container that may
+            // already have terminalized and fail the turn even though the
+            // recorded output can still hold its outcome.
             warn!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_stdout_recorded_output_read_failed",
@@ -4618,9 +4889,9 @@ async fn recover_detached_terminal_output(
                 execution_id = %execution.execution_id,
                 sandbox_id,
                 %error,
-                "failed to read recorded sandbox output; reattaching live"
+                "failed to read recorded sandbox output; surfacing for retry"
             );
-            return Ok(false);
+            return Err(SessionRuntimeError::Sandbox(error));
         }
     };
 
@@ -5462,7 +5733,7 @@ async fn record_idle_pause(
         Ok(SandboxStatus::Suspended | SandboxStatus::Stopped | SandboxStatus::Gone) => {
             return Ok(());
         }
-        Ok(SandboxStatus::Running | SandboxStatus::Created) => {}
+        Ok(SandboxStatus::Running | SandboxStatus::Created | SandboxStatus::Vacant) => {}
         Ok(SandboxStatus::Unknown(_)) => return Ok(()),
         Err(SandboxError::NotFound(_)) => return Ok(()),
         Err(error) => {
@@ -5825,6 +6096,16 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
 
 fn terminal_failure_class(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
+    // Capacity deaths are checked first because they arrive wrapped in the
+    // generic stdout-closed message and would otherwise read as `sandbox_io`.
+    // They are worth their own class: raising a memory limit and relieving node
+    // pressure are different actions, and neither is a harness problem.
+    if error.contains("oomkilled") {
+        return "oom";
+    }
+    if error.contains("evicted") {
+        return "evicted";
+    }
     if error.contains("max_duration") || error.contains("timeout") || error.contains("timed out") {
         return "timeout";
     }
@@ -5835,6 +6116,35 @@ fn terminal_failure_class(error: &str) -> &'static str {
         return "sandbox_io";
     }
     "harness"
+}
+
+/// The detail recorded when a sandbox can no longer serve io.
+///
+/// The backend's termination reason is appended when it has one. Without it
+/// every death reads as the same "no longer accepts io" string, and an
+/// OOMKilled turn is indistinguishable from a harness fault unless someone
+/// reads pod status before the kubelet collects the pod.
+fn sandbox_dead_detail(status: &SandboxStatus, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => {
+            format!("sandbox no longer accepts io (status {status:?}, reason {reason})")
+        }
+        None => format!("sandbox no longer accepts io (status {status:?})"),
+    }
+}
+
+/// The same diagnostic, for adoption giving up on a sandbox that never
+/// produced terminal output. Kept separate because that absence is material
+/// when diagnosing recovery failures.
+fn sandbox_not_openable_detail(status: &SandboxStatus, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!(
+            "sandbox not openable (status {status:?}, reason {reason}) with no recorded terminal output"
+        ),
+        None => {
+            format!("sandbox not openable (status {status:?}) with no recorded terminal output")
+        }
+    }
 }
 
 fn should_attach_session_pipe(status: &SandboxStatus) -> bool {
@@ -5851,7 +6161,9 @@ enum ExistingSandboxAction {
 fn existing_sandbox_action(status: &SandboxStatus) -> ExistingSandboxAction {
     match status {
         SandboxStatus::Running => ExistingSandboxAction::Reuse,
-        SandboxStatus::Created | SandboxStatus::Suspended => ExistingSandboxAction::ResumeOrReplace,
+        SandboxStatus::Created | SandboxStatus::Suspended | SandboxStatus::Vacant => {
+            ExistingSandboxAction::ResumeOrReplace
+        }
         SandboxStatus::Stopped | SandboxStatus::Gone | SandboxStatus::Unknown(_) => {
             ExistingSandboxAction::Replace
         }
@@ -6757,6 +7069,21 @@ fn codec_error_to_runtime(error: LinesCodecError) -> SessionRuntimeError {
     })
 }
 
+/// Applies the deployment default to a request that set no ceiling of its own.
+///
+/// A per-request `max_duration_ms` always wins, including one longer than the
+/// default: the default exists to arm the watchdog at all, not to cap what a
+/// caller may ask for.
+fn apply_default_max_duration(
+    mut input: ExecuteSessionInput,
+    default_max_duration_ms: Option<u64>,
+) -> ExecuteSessionInput {
+    if input.max_duration_ms.is_none() {
+        input.max_duration_ms = default_max_duration_ms.filter(|value| *value > 0);
+    }
+    input
+}
+
 fn duration_options(
     idle_timeout_ms: Option<u64>,
     max_duration_ms: Option<u64>,
@@ -7002,11 +7329,17 @@ pub enum SessionRuntimeError {
     #[error(transparent)]
     WarmPool(#[from] WarmPoolError),
     #[error(
-        "sandbox running capacity exceeded during {operation}: running={running}, max_running={max_running}"
+        "sandbox running capacity exceeded during {operation}: running={running}, \
+         admission_limit={admission_limit} (max_running={max_running}, \
+         memory_budget_bytes={memory_budget_bytes:?}, \
+         per_sandbox_memory_bytes={per_sandbox_memory_bytes:?})"
     )]
     CapacityExceeded {
         max_running: usize,
+        admission_limit: usize,
         running: usize,
+        memory_budget_bytes: Option<u64>,
+        per_sandbox_memory_bytes: Option<u64>,
         operation: &'static str,
     },
 }
@@ -7018,6 +7351,30 @@ mod tests {
     use centaur_session_core::SessionStatus;
     use serde_json::json;
     use time::OffsetDateTime;
+
+    #[test]
+    fn vacant_sandboxes_do_not_consume_running_slots() {
+        // The capacity bug in one assertion: a CR asking for a replica with
+        // no pod behind it reported Created, so it held a running slot that
+        // no reclamation path could ever return, and admission refused every
+        // later sandbox until someone deleted the CR by hand.
+        assert!(!status_consumes_running_slot(&SandboxStatus::Vacant));
+
+        assert!(status_consumes_running_slot(&SandboxStatus::Created));
+        assert!(status_consumes_running_slot(&SandboxStatus::Running));
+        assert!(!status_consumes_running_slot(&SandboxStatus::Suspended));
+        assert!(!status_consumes_running_slot(&SandboxStatus::Stopped));
+        assert!(!status_consumes_running_slot(&SandboxStatus::Gone));
+    }
+
+    #[test]
+    fn vacant_sandbox_resumes_rather_than_replaces() {
+        // The state volume outlives the pod, so the workspace is still there.
+        assert!(matches!(
+            existing_sandbox_action(&SandboxStatus::Vacant),
+            ExistingSandboxAction::ResumeOrReplace
+        ));
+    }
 
     #[test]
     fn sandbox_repo_cache_label_controls_access() {
@@ -7673,6 +8030,46 @@ mod tests {
         assert_eq!(
             terminal_failure_class("turn failed: model error"),
             "harness"
+        );
+    }
+
+    /// The capacity classes have to win over `sandbox_io`, because that is
+    /// exactly the string they arrive wrapped in.
+    #[test]
+    fn terminal_failure_class_separates_capacity_deaths_from_io() {
+        let oom = sandbox_dead_detail(&SandboxStatus::Stopped, Some("OOMKilled"));
+        assert_eq!(
+            terminal_failure_class(&format!(
+                "sandbox stdout closed before terminal output; {oom}"
+            )),
+            "oom"
+        );
+        assert_eq!(
+            terminal_failure_class(&format!(
+                "sandbox stdout closed before terminal output; {}",
+                sandbox_dead_detail(&SandboxStatus::Stopped, Some("Evicted"))
+            )),
+            "evicted"
+        );
+        // Without a reason the classification is unchanged.
+        assert_eq!(
+            terminal_failure_class(&format!(
+                "sandbox stdout closed before terminal output; {}",
+                sandbox_dead_detail(&SandboxStatus::Created, None)
+            )),
+            "sandbox_io"
+        );
+    }
+
+    #[test]
+    fn sandbox_dead_detail_names_the_termination_reason() {
+        assert_eq!(
+            sandbox_dead_detail(&SandboxStatus::Stopped, Some("OOMKilled")),
+            "sandbox no longer accepts io (status Stopped, reason OOMKilled)"
+        );
+        assert_eq!(
+            sandbox_dead_detail(&SandboxStatus::Created, None),
+            "sandbox no longer accepts io (status Created)"
         );
     }
 
@@ -8574,6 +8971,7 @@ mod adoption_tests {
         stopped: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<ProxyEnsure>>,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
+        read_output_failures: std::sync::Mutex<Option<usize>>,
     }
 
     impl MockBackend {
@@ -8592,6 +8990,7 @@ mod adoption_tests {
                 stopped: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
+                read_output_failures: std::sync::Mutex::new(None),
             }
         }
 
@@ -8643,6 +9042,11 @@ mod adoption_tests {
                 .insert(sandbox_id.to_owned());
         }
 
+        /// Makes the next `count` `read_output_since` calls fail transiently.
+        fn fail_next_read_output(&self, count: usize) {
+            *self.read_output_failures.lock().unwrap() = Some(count);
+        }
+
         fn stopped(&self) -> Vec<String> {
             self.stopped.lock().unwrap().clone()
         }
@@ -8690,6 +9094,16 @@ mod adoption_tests {
             _id: &SandboxId,
             _since: Option<SystemTime>,
         ) -> SandboxResult<Vec<String>> {
+            let mut failures = self.read_output_failures.lock().unwrap();
+            if let Some(remaining) = *failures {
+                if remaining > 0 {
+                    *failures = Some(remaining - 1);
+                    return Err(SandboxError::io(format!(
+                        "mock transient recorded-output read failure ({remaining})"
+                    )));
+                }
+                *failures = None;
+            }
             Ok(self.recorded_output.lock().unwrap().clone())
         }
 
@@ -10149,6 +10563,11 @@ mod adoption_tests {
             SandboxCapacityConfig {
                 max_running: 2,
                 hot_idle_grace: Duration::from_secs(300),
+                // This test asserts the eviction path, so it must fail at once
+                // rather than wait for a slot that never frees.
+                admission_wait: Duration::ZERO,
+                memory_budget_bytes: None,
+                per_sandbox_memory_bytes: None,
             },
         );
 
@@ -10186,6 +10605,95 @@ mod adoption_tests {
             event.event_type == "session.sandbox_paused"
                 && event.payload.get("reason").and_then(Value::as_str) == Some("capacity_pressure")
         }));
+    }
+
+    /// A blocked admission should wait for a slot rather than dropping the
+    /// turn. The drop is terminal -- nothing retries it and nothing surfaces on
+    /// the originating thread -- while the slot it needed usually frees seconds
+    /// later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_admission_waits_for_a_freed_running_slot() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+
+        let thread =
+            ThreadKey::parse(format!("test:capacity-wait-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let execution = store
+            .create_execution(&thread, None, json!({}))
+            .await
+            .expect("create execution");
+
+        // Two running sandboxes fill the pool with nothing evictable: the mock
+        // default is Suspended, so stale rows left by other tests skip rather
+        // than freeing a slot early and hiding the wait.
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Suspended, Vec::new()));
+        backend.set_observed_status("sbx-a", SandboxStatus::Running);
+        backend.set_observed_status("sbx-b", SandboxStatus::Running);
+
+        let controller = SandboxCapacityController::new(
+            store.clone(),
+            Arc::new(SandboxManager::new(backend.clone())),
+            Arc::new(DashMap::new()),
+            SandboxCapacityConfig {
+                max_running: 2,
+                hot_idle_grace: Duration::from_secs(300),
+                admission_wait: Duration::from_secs(30),
+                memory_budget_bytes: None,
+                per_sandbox_memory_bytes: None,
+            },
+        );
+
+        // A slot opens shortly after, the way the idle-pause worker frees one.
+        let releaser = backend.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(1_000)).await;
+            releaser.set_observed_status("sbx-b", SandboxStatus::Suspended);
+        });
+
+        let started = Instant::now();
+        controller
+            .run_with_capacity(
+                &thread,
+                &execution.execution.execution_id,
+                "cold_create",
+                || async { Ok(()) },
+            )
+            .await
+            .expect("admitted once a slot freed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1_000),
+            "admission should have waited rather than failing"
+        );
+
+        let events = store
+            .list_events_after(&thread, 0, None, 100)
+            .await
+            .expect("list events");
+        let waiting: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "session.sandbox_capacity_waiting")
+            .collect();
+        assert_eq!(waiting.len(), 1, "the wait is recorded exactly once");
+        assert_eq!(
+            waiting[0].payload.get("running").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            waiting[0].payload.get("operation").and_then(Value::as_str),
+            Some("cold_create")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10731,6 +11239,224 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopts_completed_execution_when_sandbox_stopped_with_recorded_terminal() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-stopped-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-stopped"), true).await;
+
+        // The container terminalized while the old control plane was rolling:
+        // the recorded output still holds the turn's outcome even though the
+        // sandbox no longer accepts io.
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Stopped,
+            completed_output_lines("Finished while unattached."),
+        ));
+        let runtime = runtime_with(&store, backend.clone());
+        runtime.adopt_orphaned_executions().await;
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "stopped sandbox with recorded terminal output must not fail the turn"
+        );
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Finished while unattached.")
+        );
+        assert_eq!(backend.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_retries_after_transient_recorded_output_read_failure() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-retry-read-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-retry-read"), true).await;
+
+        let backend = Arc::new(MockBackend::new(
+            SandboxStatus::Stopped,
+            completed_output_lines("Recovered on the second read."),
+        ));
+        backend.fail_next_read_output(1);
+        let runtime = runtime_with(&store, backend.clone());
+
+        // The first scan hits the transient read failure: it must surface
+        // the error so the next scan retries, not fail the execution.
+        let execution = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load execution")
+            .expect("execution exists");
+        let error = runtime
+            .adopt_orphaned_execution(&execution, false, None)
+            .await
+            .expect_err("transient read failure must propagate");
+        assert!(
+            matches!(error, SessionRuntimeError::Sandbox(_)),
+            "unexpected error: {error:?}"
+        );
+        let still_running = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("reload execution")
+            .expect("execution exists");
+        assert_eq!(still_running.status, ExecutionStatus::Running);
+        assert!(
+            !events(&store, &thread_key)
+                .await
+                .iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "transient read failure must not fail the execution"
+        );
+
+        // The lease was released: the next scan re-claims and recovers the
+        // terminal output that was already on disk.
+        runtime.adopt_orphaned_executions().await;
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Recovered on the second read.")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_skips_young_sandbox_not_open_for_io() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-young-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-young"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Created, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        runtime.adopt_orphaned_executions().await;
+
+        // A young execution whose sandbox is not openable yet is skipped
+        // (the periodic scan retries it), not failed.
+        let execution = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load execution")
+            .expect("execution exists");
+        assert_eq!(execution.status, ExecutionStatus::Running);
+        assert_eq!(backend.opens(), 0);
+        assert!(
+            !events(&store, &thread_key)
+                .await
+                .iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "young non-openable sandbox must not fail the execution"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adoption_fails_old_non_openable_sandbox_without_recorded_terminal() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:adopt-old-gone-{}", uuid::Uuid::new_v4())).unwrap();
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-old-gone"), true).await;
+        backdate_execution(&store, &execution_id, 300.0).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Stopped, Vec::new()));
+        let runtime = runtime_with(&store, backend.clone());
+        runtime.adopt_orphaned_executions().await;
+
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let all = events(&store, &thread_key).await;
+        let failed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_failed")
+            .expect("failed event");
+        let error = failed.payload["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("sandbox not openable (status Stopped)"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("no recorded terminal output"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(backend.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stdout_eof_retries_recorded_output_before_live_reattach() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:eof-retry-read-{}", uuid::Uuid::new_v4())).unwrap();
+        orphaned_execution(&store, &thread_key, Some("sbx-eof-retry"), true).await;
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+
+        let runtime = runtime_with(&store, backend.clone());
+        runtime
+            .ensure_session_pipe(&thread_key, "sbx-eof-retry")
+            .await
+            .expect("open initial pipe");
+        backend.set_recorded_output(completed_output_lines(
+            "Recovered after a transient read failure.",
+        ));
+        backend.fail_next_read_output(1);
+        drop(stdout);
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.execution_failed"),
+            "transient recorded-output read failure must not fail the turn"
+        );
+        assert!(
+            all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_recovered"),
+            "expected recorded-output recovery event"
+        );
+        assert!(
+            !all.iter()
+                .any(|event| event.event_type == "session.stdout_pump_reattached"),
+            "recovery should avoid a live reattach"
+        );
+        let completed = all
+            .iter()
+            .find(|event| event.event_type == "session.execution_completed")
+            .expect("completed event");
+        assert_eq!(
+            completed.payload["result_text"].as_str(),
+            Some("Recovered after a transient read failure.")
+        );
+        assert_eq!(backend.opens(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fails_orphans_whose_sandbox_is_gone() {
         let Some(store) = test_store().await else {
             return;
@@ -11202,5 +11928,51 @@ mod adoption_tests {
             .fail_execution_if_active(&execution_id, "test cleanup")
             .await
             .expect("terminalize execution");
+    }
+
+    fn execute_input(max_duration_ms: Option<u64>) -> ExecuteSessionInput {
+        ExecuteSessionInput {
+            idempotency_key: None,
+            metadata: None,
+            input_lines: vec!["{}".to_owned()],
+            idle_timeout_ms: None,
+            max_duration_ms,
+        }
+    }
+
+    #[test]
+    fn default_max_duration_is_zero_disabled() {
+        // 0 has to mean unbounded, not "expire immediately": it is the value a
+        // deployment that never set the knob renders.
+        assert_eq!(
+            apply_default_max_duration(execute_input(None), Some(0)).max_duration_ms,
+            None
+        );
+        assert_eq!(
+            apply_default_max_duration(execute_input(None), None).max_duration_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn default_max_duration_fills_an_unset_request() {
+        assert_eq!(
+            apply_default_max_duration(execute_input(None), Some(1_800_000)).max_duration_ms,
+            Some(1_800_000)
+        );
+    }
+
+    /// A request that names its own ceiling keeps it, including one longer
+    /// than the deployment default -- the default arms the watchdog, it does
+    /// not cap what a caller may ask for.
+    #[test]
+    fn request_max_duration_overrides_the_default() {
+        for requested in [60_000, 7_200_000] {
+            assert_eq!(
+                apply_default_max_duration(execute_input(Some(requested)), Some(1_800_000))
+                    .max_duration_ms,
+                Some(requested)
+            );
+        }
     }
 }

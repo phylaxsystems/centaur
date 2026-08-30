@@ -204,6 +204,33 @@ export async function forwardToSessionApi(
 }
 
 /**
+ * Append context only when a session already exists.
+ *
+ * Lifecycle webhooks such as `pull_request.closed` are delivered for every PR
+ * in an installation. Calling the ordinary create-or-get path here would
+ * manufacture two empty sessions for every unrelated close. A 404 therefore
+ * means there is no active conversation to notify, not that one should be
+ * created.
+ */
+export async function appendToExistingSession(
+  options: GithubbotOptions,
+  threadId: string,
+  messages: GithubbotApiMessage[],
+): Promise<boolean> {
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(apiSessionUrl(options.apiUrl, threadId), {
+    method: "GET",
+    headers: apiHeaders(options, false),
+  });
+  if (response.status === 404) return false;
+  await ensureApiOk(response, "get session", options);
+  if (messages.length > 0) {
+    await appendSessionMessages(options, threadId, messages);
+  }
+  return true;
+}
+
+/**
  * Execute the session turn on its own (start the agent run), returning the
  * execution. Split out of forwardToSessionApi (mirrors discordbot) so the
  * render stream can run it AFTER the working ack lands — the execute call

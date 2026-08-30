@@ -586,6 +586,31 @@ describe("linearbot comment-thread pipeline", () => {
     ).toHaveLength(1);
   });
 
+  it("interrupts a running assignment when the issue is taken back", async () => {
+    const threadKey = `linear:${ISSUE_ID}`;
+    await postWebhook(
+      issueAssignmentPayload({ updatedAt: "2026-06-16T04:30:00.000Z" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((execute) => execute.threadKey === threadKey),
+    );
+
+    const response = await postWebhook(
+      issueReleasePayload({ updatedAt: "2026-06-16T04:31:00.000Z" }),
+    );
+    expect(response.status).toBe(200);
+    await waitFor(() =>
+      codexApi.interrupts.some(
+        (interrupt) => interrupt.threadKey === threadKey,
+      ),
+    );
+    expect(
+      codexApi.interrupts.find(
+        (interrupt) => interrupt.threadKey === threadKey,
+      )?.reason,
+    ).toContain("taken back");
+  });
+
   it("does not run a turn on a non-assignee edit to an issue the bot owns", async () => {
     await postWebhook(
       issueAssignmentPayload({
@@ -884,6 +909,25 @@ function issueAssignmentPayload(input: {
       ...(input.delegateId !== undefined
         ? { delegateId: input.delegateId }
         : {}),
+      updatedAt: input.updatedAt,
+    },
+  };
+}
+
+function issueReleasePayload(input: { updatedAt: string }) {
+  return {
+    action: "update",
+    type: "Issue",
+    createdAt: new Date().toISOString(),
+    organizationId: ORG_ID,
+    webhookTimestamp: Date.now(),
+    webhookId: "wh-issue-release",
+    actor: { id: USER_ID },
+    updatedFrom: { assigneeId: BOT_USER_ID },
+    data: {
+      id: ISSUE_ID,
+      assigneeId: null,
+      delegateId: null,
       updatedAt: input.updatedAt,
     },
   };
@@ -1524,6 +1568,7 @@ type MockSessionApi = {
     threadKey: string;
   }>;
   executes: MockSessionRequest<LinearbotExecuteSessionRequest>[];
+  interrupts: Array<{ reason: string; threadKey: string }>;
   reset(): void;
   url: string;
 };
@@ -1532,6 +1577,7 @@ function startMockCodexApi(): MockSessionApi {
   const appends: MockSessionRequest<LinearbotAppendMessagesRequest>[] = [];
   const creates: MockSessionRequest<LinearbotCreateSessionRequest>[] = [];
   const executes: MockSessionRequest<LinearbotExecuteSessionRequest>[] = [];
+  const interrupts: Array<{ reason: string; threadKey: string }> = [];
   const eventRequests: Array<{
     afterEventId: number;
     executionId?: string;
@@ -1620,6 +1666,15 @@ function startMockCodexApi(): MockSessionApi {
           thread_key: threadKey,
         });
       }
+      if (request.method === "POST" && suffix === "interrupt") {
+        const body = (await request.json()) as { reason?: string };
+        interrupts.push({ reason: body.reason ?? "", threadKey });
+        return Response.json({
+          interrupted: executes.some(
+            (execute) => execute.threadKey === threadKey,
+          ),
+        });
+      }
       if (request.method === "GET" && suffix === "events") {
         const executionId = url.searchParams.get("execution_id") ?? undefined;
         eventRequests.push({
@@ -1657,6 +1712,7 @@ function startMockCodexApi(): MockSessionApi {
     creates,
     eventRequests,
     executes,
+    interrupts,
     url: `http://127.0.0.1:${server.port}`,
     emitOutputLines(threadKey, lines, executionId) {
       for (const line of lines) {
@@ -1674,6 +1730,7 @@ function startMockCodexApi(): MockSessionApi {
       creates.length = 0;
       eventRequests.length = 0;
       executes.length = 0;
+      interrupts.length = 0;
       idempotentExecutions.clear();
       pendingEvents.clear();
       for (const handles of streams.values()) {

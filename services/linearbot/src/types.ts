@@ -1,3 +1,5 @@
+import type { ReasoningEffortPolicy } from "./reasoning-effort";
+
 import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import type { CodexAppServerToChatStreamOptions } from "@centaur/rendering";
 import type { Attachment, Chat, Logger, StateAdapter } from "chat";
@@ -89,6 +91,39 @@ export type LinearbotFetch = (
 export type LinearbotOptions = {
   apiKey?: string;
   apiUrl: string;
+  /** Replaces the kickoff prompt used when an owned issue arrives with no instructions. */
+  emptyPromptInstruction?: string;
+  /**
+   * Replaces the ownership contract injected on owned-issue turns. Deployments
+   * that reserve Done for human verification state their whole policy here
+   * once, instead of counter-instructing from the system-prompt overlay and
+   * leaving the model to reconcile two contradictory instructions every turn.
+   */
+  ownershipContext?: string;
+  /**
+   * Assignment turns allowed in flight at once — this ingress's share of a
+   * sandbox fleet shared with githubbot, slackbot and the console. Shares are
+   * meant to oversubscribe (x/y/z across n pods, summing past n) so a quiet
+   * ingress leaves its pods usable, which makes the number a deployment-wide
+   * decision. Defaults to 0: unbounded, deferring to the fleet's own admission
+   * limit rather than inventing a second one here. Surplus turns queue; they
+   * are not dropped.
+   */
+  assignmentConcurrency?: number;
+  /**
+   * Minimum spacing between consecutive assignment turn starts, plus a random
+   * extra delay in `[0, staggerMs)`. Keeps a burst of Issue webhooks from
+   * hitting sandbox admission, spawning sandboxes, and issuing their first
+   * inference call all on the same instant. Defaults to 250ms; 0 disables it.
+   */
+  assignmentStaggerMs?: number;
+  /**
+   * Reasoning effort per turn type. This bot's turns are mostly autonomous, so
+   * there is no message for a `-rsn` flag to ride on and every turn otherwise
+   * runs at the harness global default -- which suits neither an assignment
+   * turn implementing a whole ticket nor a one-line comment reply.
+   */
+  reasoningEffort?: ReasoningEffortPolicy;
   /**
    * Connect the Postgres state (and initialize the adapter) at startup.
    * Defaults to true; tests pass false to skip the live connect against mock
@@ -190,6 +225,8 @@ export type ForwardSessionInput = {
   messages: LinearbotApiMessage[];
   /** Per-turn model override parsed from message flags (--model/--opus/...). */
   model?: string;
+  /** Per-turn reasoning effort, forwarded to the harness as turn/start.effort. */
+  reasoning?: string;
   /** Per-turn model provider override parsed from message flags (--meta). */
   provider?: string;
   onEventId(eventId: number): void;

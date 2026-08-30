@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -272,6 +273,46 @@ impl ResourceRequirements {
     pub fn is_empty(&self) -> bool {
         self.claims.is_empty() && self.limits.is_empty() && self.requests.is_empty()
     }
+
+    /// The `memory` limit in bytes, `None` when it is absent or not
+    /// expressible as a whole-byte quantity.
+    pub fn memory_limit_bytes(&self) -> Option<u64> {
+        self.limits
+            .get("memory")
+            .and_then(|quantity| quantity_to_bytes(quantity))
+    }
+}
+
+/// Multiplier of one binary kibi unit; a whole quantity of this size is
+/// 1 GiB of bytes.
+const GIB_BYTES: u64 = 1 << 30;
+
+/// Parse a Kubernetes memory quantity into bytes: a bare integer, or an
+/// integer mantissa with a binary (`Ki`, `Mi`, `Gi`, `Ti`) or decimal
+/// (`K`, `M`, `G`, `T`) suffix. Anything else, including fractional and
+/// milli forms, parses to `None` rather than guessing.
+pub fn quantity_to_bytes(quantity: &str) -> Option<u64> {
+    let quantity = quantity.trim();
+    let suffixes: &[(&str, u64)] = &[
+        ("Ki", 1 << 10),
+        ("Mi", 1 << 20),
+        ("Gi", GIB_BYTES),
+        ("Ti", 1 << 40),
+        ("K", 1_000),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+    ];
+    let (mantissa, multiplier) = suffixes
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            quantity
+                .strip_suffix(suffix)
+                .map(|mantissa| (mantissa, *multiplier))
+        })
+        .unwrap_or((quantity, 1));
+    let mantissa = u64::from_str(mantissa).ok()?;
+    mantissa.checked_mul(multiplier)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -312,4 +353,36 @@ where
         .into_iter()
         .map(|(name, quantity)| (name, quantity.into_string()))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantity_parsing_covers_fleet_shapes() {
+        assert_eq!(quantity_to_bytes("1048576"), Some(1_048_576));
+        assert_eq!(quantity_to_bytes("512Mi"), Some(512 * (1 << 20)));
+        assert_eq!(quantity_to_bytes("32Gi"), Some(32 * GIB_BYTES));
+        assert_eq!(quantity_to_bytes("1Ti"), Some(1 << 40));
+        assert_eq!(quantity_to_bytes("2G"), Some(2_000_000_000));
+        assert_eq!(quantity_to_bytes(" 8Ki "), Some(8 * (1 << 10)));
+    }
+
+    #[test]
+    fn quantity_parsing_rejects_unsizable_forms() {
+        assert_eq!(quantity_to_bytes("0.5Gi"), None);
+        assert_eq!(quantity_to_bytes("500m"), None);
+        assert_eq!(quantity_to_bytes(""), None);
+        assert_eq!(quantity_to_bytes("not-a-quantity"), None);
+        // Mantissa that overflows once the multiplier is applied.
+        assert_eq!(quantity_to_bytes("18446744073709551616Ki"), None);
+    }
+
+    #[test]
+    fn memory_limit_bytes_reads_the_limit_map() {
+        let resources = ResourceRequirements::new().limit("memory", "32Gi");
+        assert_eq!(resources.memory_limit_bytes(), Some(32 * GIB_BYTES));
+        assert_eq!(ResourceRequirements::new().memory_limit_bytes(), None);
+    }
 }

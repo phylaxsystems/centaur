@@ -12,6 +12,7 @@
           "items": { "type": "string" },
           "uniqueItems": true
         },
+        "entitlementsHosts": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "sentryDsn": { "type": "string" },
         "railsEnv": { "type": "string" },
         "image": {
@@ -338,6 +339,11 @@
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
         "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
+        "sandboxPausedProxySweepIntervalSecs": { "type": "integer", "minimum": 0 },
+        "sandboxPausedProxyMarginPods": { "type": "integer", "minimum": 0 },
+        "sandboxPausedProxyCap": { "type": "integer", "minimum": 0 },
+        "sandboxAdmissionWaitSecs": { "type": "integer", "minimum": 0 },
+        "sandboxMemoryBudgetGib": { "type": "integer", "minimum": 0 },
         "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
         "etl": {
@@ -415,7 +421,8 @@
                 "enabled": { "type": "boolean" },
                 "intervalSeconds": { "type": "integer", "minimum": 1 },
                 "batchSize": { "type": "integer", "minimum": 1 },
-                "model": { "type": "string", "minLength": 1 }
+                "model": { "type": "string", "minLength": 1 },
+                "dimensions": { "type": "integer", "minimum": 1, "maximum": 2000 }
               }
             }
           }
