@@ -4,7 +4,7 @@ import { backgroundWaitUntil } from "./context";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import { reviewThreadKey } from "./review";
 import { forwardToSessionApi } from "./session-api";
-import { runTurnStream } from "./turn";
+import { runTurnStream, turnOutputChars } from "./turn";
 import {
   fetchCiEvaluation,
   maybeEmitReviewSubmitted,
@@ -810,6 +810,7 @@ function fireManagementTurn(
     runTurnStream(ctx.options, forwardInput)
       .then(async (result) => {
         traceLog(ctx.options, "githubbot_management_turn_complete", trace, {
+          chars: turnOutputChars(result),
           failed: result.failed,
           work: message.label,
         });

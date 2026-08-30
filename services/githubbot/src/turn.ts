@@ -57,6 +57,25 @@ export type TurnResult = {
   fallbackText: string;
 };
 
+/**
+ * Size of what a turn produced, for the `chars` field on its completion log.
+ *
+ * Turns whose deliverable is not a rendered comment -- a review, issue work, a
+ * PR-management action -- logged no size at all, so a monitor could not tell a
+ * long successful turn from an aborted one and classified every one of them
+ * unverifiable. Any long turn on those surfaces then looks like a failure.
+ *
+ * Measures the answer rather than a rendered body, because these surfaces have
+ * no single body: what they emit is a review comment, an issue comment, or a
+ * push. A failed turn reports its error text for the same reason a failed
+ * comment turn does -- zero would read as "produced nothing", which is a
+ * different fault from "produced an error".
+ */
+export function turnOutputChars(result: TurnResult): number {
+  if (result.failed) return result.errorText.length;
+  return (result.answer || result.fallbackText).length;
+}
+
 const THREAD_KEY_PATTERN =
   /^github:([^/:]+)\/([^:]+):(?:issue:(\d+)|(\d+)(?::rc:(\d+))?)$/;
 
