@@ -89,6 +89,15 @@ export type LinearbotFetch = (
 export type LinearbotOptions = {
   apiKey?: string;
   apiUrl: string;
+  /** Replaces the kickoff prompt used when an owned issue arrives with no instructions. */
+  emptyPromptInstruction?: string;
+  /**
+   * Replaces the ownership contract injected on owned-issue turns. Deployments
+   * that reserve Done for human verification state their whole policy here
+   * once, instead of counter-instructing from the system-prompt overlay and
+   * leaving the model to reconcile two contradictory instructions every turn.
+   */
+  ownershipContext?: string;
   /**
    * Assignment turns allowed in flight at once — this ingress's share of a
    * sandbox fleet shared with githubbot, slackbot and the console. Shares are
