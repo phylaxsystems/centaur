@@ -1,5 +1,15 @@
 -- This migration is intentionally outside the main SQLx migration set.
 -- Apply it manually only in environments participating in the experiment.
+--
+-- The embedding column width must match COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS
+-- (chart: apiRs.etl.companyContextEmbeddings.dimensions), which the embedding
+-- workflow and the company_context tool both read. The default below is that
+-- setting's default. Serving a model with a different native width means
+-- editing the vector(...) width here before applying, and re-embedding any
+-- rows already written at the old width -- Postgres rejects a comparison
+-- between vectors of different widths, so a mismatch fails loudly rather than
+-- degrading search. pgvector will not build an HNSW or IVFFlat index above
+-- 2000 dimensions.
 
 create extension if not exists vector;
 
