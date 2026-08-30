@@ -71,6 +71,16 @@ spec:
             - name: LINEARBOT_EMPTY_PROMPT_INSTRUCTION
               value: {{ .Values.linearbot.emptyPromptInstruction | quote }}
 {{- end }}
+{{- with .Values.linearbot.reasoningEffort }}
+{{- if .assignment }}
+            - name: LINEARBOT_EFFORT_ASSIGNMENT
+              value: {{ .assignment | quote }}
+{{- end }}
+{{- if .comment }}
+            - name: LINEARBOT_EFFORT_COMMENT
+              value: {{ .comment | quote }}
+{{- end }}
+{{- end }}
 {{- if .Values.codex.customProviders }}
             - name: CODEX_CUSTOM_PROVIDERS
               value: {{ .Values.codex.customProviders | toJson | quote }}

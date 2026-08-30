@@ -59,6 +59,10 @@ const options: LinearbotOptions = {
   linearWebhookSecret,
   maxDurationMs: optionalNumberEnv("SESSION_MAX_DURATION_MS"),
   ownershipContext: optionalEnv("LINEARBOT_OWNERSHIP_CONTEXT"),
+  reasoningEffort: {
+    assignment: optionalEnv("LINEARBOT_EFFORT_ASSIGNMENT"),
+    comment: optionalEnv("LINEARBOT_EFFORT_COMMENT"),
+  },
   postgresUrl,
   stateKeyPrefix: optionalEnv("LINEARBOT_STATE_KEY_PREFIX"),
   userName: stringEnv("LINEARBOT_USER_NAME", "centaur"),

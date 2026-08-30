@@ -669,6 +669,14 @@ linearbot:
   # Replaces the kickoff prompt used when an owned issue arrives with no
   # instructions. Unset uses the default.
   emptyPromptInstruction: ""
+  # Reasoning effort per turn type (codex turn/start.effort). Both unset run at
+  # the harness default. These turns are autonomous, so there is no message for
+  # a -rsn flag to ride on, and one global setting suits neither an assignment
+  # turn implementing a whole ticket nor a one-line comment reply.
+  # Accepts none | minimal | low | medium | high | xhigh | max.
+  reasoningEffort:
+    assignment: ""
+    comment: ""
   extraEnv: {}
   resources: {}
 
