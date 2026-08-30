@@ -3666,9 +3666,13 @@ impl SessionRuntime {
                 return Err(SessionRuntimeError::Sandbox(error));
             }
         };
-        let status = match self.sandbox_runtime.manager.status(&id).await {
-            Ok(status) => status,
-            Err(SandboxError::NotFound(_)) => SandboxStatus::Gone,
+        // Observe rather than only reading status: a sandbox the kubelet killed
+        // carries its cause on the pod, and that pod is usually collected before
+        // anyone reads the failed execution, so the reason has to be captured
+        // here, at the moment we give up on it.
+        let observed = match self.sandbox_runtime.manager.observe(&id).await {
+            Ok(observed) => Some(observed),
+            Err(SandboxError::NotFound(_)) => None,
             Err(error) => {
                 // Transient status failures must not fail a possibly live
                 // execution; release the claim and retry on the next scan.
@@ -3682,6 +3686,9 @@ impl SessionRuntime {
                 return Err(SessionRuntimeError::Sandbox(error));
             }
         };
+        let status = observed
+            .as_ref()
+            .map_or(SandboxStatus::Gone, |observed| observed.status.clone());
         if let Some(terminal) = terminal_output_from_lines(&lines) {
             info!(
                 component = COMPONENT_SESSION_RUNTIME,
@@ -3745,8 +3752,11 @@ impl SessionRuntime {
                 thread_key,
                 execution_id,
                 sandbox_id,
-                &format!(
-                    "sandbox not openable (status {status:?}) with no recorded terminal output"
+                &sandbox_not_openable_detail(
+                    &status,
+                    observed
+                        .as_ref()
+                        .and_then(|observed| observed.reason.as_deref()),
                 ),
             )
             .await;
@@ -4629,8 +4639,8 @@ async fn reattach_session_pipe(
     }
 
     let id = SandboxId::new(sandbox_id);
-    match ctx.manager.status(&id).await {
-        Ok(status) if status.can_open_io() => match ctx.manager.open_io(&id).await {
+    match ctx.manager.observe(&id).await {
+        Ok(observed) if observed.status.can_open_io() => match ctx.manager.open_io(&id).await {
             Ok(io) => {
                 let parts = io.into_parts();
                 let new_pipe = session_pipe_from_stdin(parts.stdin);
@@ -4647,9 +4657,10 @@ async fn reattach_session_pipe(
                 ReattachOutcome::Retryable(format!("sandbox stdout reattach failed: {error}"))
             }
         },
-        Ok(status) => {
-            ReattachOutcome::Dead(format!("sandbox no longer accepts io (status {status:?})"))
-        }
+        Ok(observed) => ReattachOutcome::Dead(sandbox_dead_detail(
+            &observed.status,
+            observed.reason.as_deref(),
+        )),
         Err(SandboxError::NotFound(_)) => {
             ReattachOutcome::Dead("sandbox no longer exists".to_owned())
         }
@@ -5892,6 +5903,16 @@ fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
 
 fn terminal_failure_class(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
+    // Capacity deaths are checked first because they arrive wrapped in the
+    // generic stdout-closed message and would otherwise read as `sandbox_io`.
+    // They are worth their own class: raising a memory limit and relieving node
+    // pressure are different actions, and neither is a harness problem.
+    if error.contains("oomkilled") {
+        return "oom";
+    }
+    if error.contains("evicted") {
+        return "evicted";
+    }
     if error.contains("max_duration") || error.contains("timeout") || error.contains("timed out") {
         return "timeout";
     }
@@ -5902,6 +5923,35 @@ fn terminal_failure_class(error: &str) -> &'static str {
         return "sandbox_io";
     }
     "harness"
+}
+
+/// The detail recorded when a sandbox can no longer serve io.
+///
+/// The backend's termination reason is appended when it has one. Without it
+/// every death reads as the same "no longer accepts io" string, and an
+/// OOMKilled turn is indistinguishable from a harness fault unless someone
+/// reads pod status before the kubelet collects the pod.
+fn sandbox_dead_detail(status: &SandboxStatus, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => {
+            format!("sandbox no longer accepts io (status {status:?}, reason {reason})")
+        }
+        None => format!("sandbox no longer accepts io (status {status:?})"),
+    }
+}
+
+/// The same diagnostic, for adoption giving up on a sandbox that never
+/// produced terminal output. Kept separate because that absence is material
+/// when diagnosing recovery failures.
+fn sandbox_not_openable_detail(status: &SandboxStatus, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!(
+            "sandbox not openable (status {status:?}, reason {reason}) with no recorded terminal output"
+        ),
+        None => {
+            format!("sandbox not openable (status {status:?}) with no recorded terminal output")
+        }
+    }
 }
 
 fn should_attach_session_pipe(status: &SandboxStatus) -> bool {
@@ -7740,6 +7790,46 @@ mod tests {
         assert_eq!(
             terminal_failure_class("turn failed: model error"),
             "harness"
+        );
+    }
+
+    /// The capacity classes have to win over `sandbox_io`, because that is
+    /// exactly the string they arrive wrapped in.
+    #[test]
+    fn terminal_failure_class_separates_capacity_deaths_from_io() {
+        let oom = sandbox_dead_detail(&SandboxStatus::Stopped, Some("OOMKilled"));
+        assert_eq!(
+            terminal_failure_class(&format!(
+                "sandbox stdout closed before terminal output; {oom}"
+            )),
+            "oom"
+        );
+        assert_eq!(
+            terminal_failure_class(&format!(
+                "sandbox stdout closed before terminal output; {}",
+                sandbox_dead_detail(&SandboxStatus::Stopped, Some("Evicted"))
+            )),
+            "evicted"
+        );
+        // Without a reason the classification is unchanged.
+        assert_eq!(
+            terminal_failure_class(&format!(
+                "sandbox stdout closed before terminal output; {}",
+                sandbox_dead_detail(&SandboxStatus::Created, None)
+            )),
+            "sandbox_io"
+        );
+    }
+
+    #[test]
+    fn sandbox_dead_detail_names_the_termination_reason() {
+        assert_eq!(
+            sandbox_dead_detail(&SandboxStatus::Stopped, Some("OOMKilled")),
+            "sandbox no longer accepts io (status Stopped, reason OOMKilled)"
+        );
+        assert_eq!(
+            sandbox_dead_detail(&SandboxStatus::Created, None),
+            "sandbox no longer accepts io (status Created)"
         );
     }
 

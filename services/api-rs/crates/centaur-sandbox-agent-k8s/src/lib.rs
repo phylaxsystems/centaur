@@ -315,7 +315,8 @@ impl AgentSandboxBackend {
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
-            .with_suspended_since(sandbox_paused_at(sandbox)))
+            .with_suspended_since(sandbox_paused_at(sandbox))
+            .with_reason(pod.as_ref().and_then(pod_termination_reason)))
     }
 
     async fn patch_sandbox_merge(&self, id: &SandboxId, patch: Value) -> SandboxResult<()> {
@@ -802,6 +803,36 @@ fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
         "unknown" => SandboxStatus::Unknown("unknown".to_owned()),
         other => SandboxStatus::Unknown(other.to_owned()),
     }
+}
+
+/// Why the sandbox's container died, when the pod still records it.
+///
+/// A sandbox killed by the kubelet reports the same "stdout closed" symptom as
+/// every other death, so without this the cause is invisible unless an operator
+/// reads pod status before the pod is collected. `OOMKilled` and `Evicted` are
+/// the ones worth naming: they are capacity problems, not harness problems, and
+/// they are actionable in a way a generic io failure is not.
+///
+/// The current `state` is preferred over `last_state`: a container that has
+/// just terminated carries the reason there, and `last_state` holds the
+/// previous run once the kubelet restarts it. The pod-level `reason` covers
+/// eviction, where the container may never report one.
+fn pod_termination_reason(pod: &Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    let from_container = status
+        .container_statuses
+        .iter()
+        .flatten()
+        .find_map(|container| {
+            let terminated = |state: &Option<k8s_openapi::api::core::v1::ContainerState>| {
+                state
+                    .as_ref()
+                    .and_then(|state| state.terminated.as_ref())
+                    .and_then(|terminated| terminated.reason.clone())
+            };
+            terminated(&container.state).or_else(|| terminated(&container.last_state))
+        });
+    from_container.or_else(|| status.reason.clone())
 }
 
 fn pod_ready(pod: &Pod) -> bool {
@@ -1890,5 +1921,68 @@ mod tests {
             }),
             ..Pod::default()
         }
+    }
+
+    fn terminated_pod(
+        state: Option<&str>,
+        last_state: Option<&str>,
+        pod_reason: Option<&str>,
+    ) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus,
+        };
+        let terminated = |reason: Option<&str>| {
+            reason.map(|reason| ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    reason: Some(reason.to_owned()),
+                    ..ContainerStateTerminated::default()
+                }),
+                ..ContainerState::default()
+            })
+        };
+        Pod {
+            status: Some(PodStatus {
+                phase: Some("Failed".to_owned()),
+                reason: pod_reason.map(str::to_owned),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "agent".to_owned(),
+                    state: terminated(state),
+                    last_state: terminated(last_state),
+                    ..ContainerStatus::default()
+                }]),
+                ..PodStatus::default()
+            }),
+            ..Pod::default()
+        }
+    }
+
+    #[test]
+    fn termination_reason_reads_the_current_terminated_state() {
+        let pod = terminated_pod(Some("OOMKilled"), None, None);
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("OOMKilled"));
+    }
+
+    /// Once the kubelet restarts a container the cause moves to `last_state`,
+    /// so a restarted OOM must still name itself.
+    #[test]
+    fn termination_reason_falls_back_to_last_state() {
+        let pod = terminated_pod(None, Some("OOMKilled"), None);
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("OOMKilled"));
+    }
+
+    /// An evicted pod may carry no container state at all; the reason is on
+    /// the pod.
+    #[test]
+    fn termination_reason_falls_back_to_the_pod_reason() {
+        let pod = terminated_pod(None, None, Some("Evicted"));
+        assert_eq!(pod_termination_reason(&pod).as_deref(), Some("Evicted"));
+    }
+
+    #[test]
+    fn termination_reason_is_absent_for_a_healthy_pod() {
+        assert_eq!(
+            pod_termination_reason(&pod_with_phase_and_ready("Running", true)),
+            None
+        );
     }
 }
