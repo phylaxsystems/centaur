@@ -530,34 +530,15 @@ impl SandboxCapacityController {
                 .await
             {
                 Ok(()) => return action().await,
-                Err(SessionRuntimeError::CapacityExceeded {
-                    max_running,
-                    admission_limit,
-                    running,
-                    memory_budget_bytes,
-                    per_sandbox_memory_bytes,
-                    ..
-                }) => {
+                Err(error @ SessionRuntimeError::CapacityExceeded { .. }) => {
                     if Instant::now() >= deadline {
-                        return Err(SessionRuntimeError::CapacityExceeded {
-                            max_running,
-                            admission_limit,
-                            running,
-                            memory_budget_bytes,
-                            per_sandbox_memory_bytes,
-                            operation,
-                        });
+                        return Err(error);
                     }
                     if !recorded_wait {
                         self.record_capacity_waiting(
                             protected_thread_key,
                             trigger_execution_id,
-                            operation,
-                            running,
-                            max_running,
-                            admission_limit,
-                            memory_budget_bytes,
-                            per_sandbox_memory_bytes,
+                            &error,
                             deadline,
                         )
                         .await;
@@ -583,24 +564,30 @@ impl SandboxCapacityController {
         &self,
         protected_thread_key: &ThreadKey,
         trigger_execution_id: &str,
-        operation: &'static str,
-        running: usize,
-        max_running: usize,
-        admission_limit: usize,
-        memory_budget_bytes: Option<u64>,
-        per_sandbox_memory_bytes: Option<u64>,
+        error: &SessionRuntimeError,
         deadline: Instant,
     ) {
+        let SessionRuntimeError::CapacityExceeded {
+            max_running,
+            admission_limit,
+            running,
+            memory_budget_bytes,
+            per_sandbox_memory_bytes,
+            operation,
+        } = error
+        else {
+            return;
+        };
         let wait_secs = deadline.saturating_duration_since(Instant::now()).as_secs();
         let running_memory_bytes =
-            per_sandbox_memory_bytes.and_then(|per| per.checked_mul(running as u64));
+            per_sandbox_memory_bytes.and_then(|per| per.checked_mul(*running as u64));
         let memory_headroom_bytes = match (
             memory_budget_bytes,
             per_sandbox_memory_bytes,
             running_memory_bytes,
         ) {
             (Some(budget), Some(per), Some(running_memory)) => {
-                Some(budget.saturating_sub(running_memory).saturating_sub(per))
+                Some(budget.saturating_sub(running_memory).saturating_sub(*per))
             }
             _ => None,
         };
