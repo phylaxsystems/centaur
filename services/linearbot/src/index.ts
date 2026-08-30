@@ -15,6 +15,8 @@ import {
   type Thread,
 } from "chat";
 import { Hono, type Context } from "hono";
+
+import { AssignmentGate } from "./assignment-gate";
 import pg from "pg";
 import {
   parseIssueAssignmentWebhook,
@@ -369,6 +371,9 @@ const ISSUE_CONTEXT_PREAMBLE_MAX_CHARS = 8_000;
 // itself is the "I've started" signal). Replaced by the live thought, then the
 // final answer, as the run proceeds.
 const WORK_START_HEADLINE = "On it — working on this issue.";
+const ASSIGNMENT_QUEUED_NOTICE =
+  "⏳ Queued — I'm at my limit for assignments running at once. " +
+  "I'll start on this as soon as a slot frees up.";
 const PROFILE_HANDLE_PATTERN = /\/profiles\/([^/?#]+)/;
 
 type ThreadHandlerInput = {
@@ -656,6 +661,28 @@ async function appendThreadFollowup(input: {
  * on the issue's sandbox and post the result as a comment. Uses the Issue
  * webhook (not an AgentSessionEvent) so it survives agent sessions being off.
  */
+// Off: how many turns may run at once is this ingress's slice of a sandbox
+// fleet shared with the others, which only a deployment can size. api-rs leaves
+// its own capacity limit off by default too.
+const DEFAULT_ASSIGNMENT_CONCURRENCY = 0;
+// On: spacing costs a burst a few hundred milliseconds and buys admission,
+// sandbox spawn and first inference not landing on the same instant.
+const DEFAULT_ASSIGNMENT_STAGGER_MS = 250;
+
+/**
+ * One gate per process. Assignment bursts arrive as independent webhooks, so
+ * the bound has to be shared across them rather than per-request.
+ */
+let assignmentGate: AssignmentGate | undefined;
+
+function assignmentGateFor(options: LinearbotOptions): AssignmentGate {
+  assignmentGate ??= new AssignmentGate({
+    concurrency: options.assignmentConcurrency ?? DEFAULT_ASSIGNMENT_CONCURRENCY,
+    staggerMs: options.assignmentStaggerMs ?? DEFAULT_ASSIGNMENT_STAGGER_MS,
+  });
+  return assignmentGate;
+}
+
 function handleIssueAssignment(
   rawBody: string,
   input: ThreadHandlerInput,
@@ -689,19 +716,29 @@ function handleIssueAssignment(
     const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
       .linearClient;
     backgroundWaitUntil(
-      runThreadTurn({
-        announceStart: true,
-        applyStatus: true,
-        botUserId: input.botUserId,
-        client,
-        executeMessage: assignmentInstructionMessage(event, threadKey),
-        issueId: event.issueId,
-        options,
-        overrides: {},
-        thread,
-        threadKey,
-        trace,
-      }),
+      assignmentGateFor(options).run(
+        () =>
+          runThreadTurn({
+            announceStart: true,
+            applyStatus: true,
+            botUserId: input.botUserId,
+            client,
+            executeMessage: assignmentInstructionMessage(event, threadKey),
+            issueId: event.issueId,
+            options,
+            overrides: {},
+            thread,
+            threadKey,
+            trace,
+          }),
+        (queuedAhead) => {
+          traceLog(options, "linearbot_assignment_queued", trace, {
+            issue_id: event.issueId,
+            queued_ahead: queuedAhead,
+          });
+          announceAssignmentQueued(client, event.issueId, options);
+        },
+      ),
     );
   })();
 }
@@ -1020,6 +1057,30 @@ async function runThreadTurn(input: {
     chars: body?.length ?? 0,
     failed,
   });
+}
+
+/**
+ * Says on the issue that the assignment is waiting for a slot. The wait is
+ * otherwise undetectable from Linear: nothing posts, the status does not move,
+ * and the issue is indistinguishable from one the bot never picked up.
+ */
+function announceAssignmentQueued(
+  client: LinearSessionCapableAdapter["linearClient"],
+  issueId: string,
+  options: LinearbotOptions,
+): void {
+  if (!client) return;
+  backgroundWaitUntil(
+    (async () => {
+      try {
+        await postIssueReply(client, { body: ASSIGNMENT_QUEUED_NOTICE, issueId });
+      } catch (error) {
+        (options.logger ?? noopLogger).debug("linearbot_queued_notice_failed", {
+          error: errorMessage(error),
+        });
+      }
+    })(),
+  );
 }
 
 /** Synthetic "work this assigned issue" prompt for an assignment turn. */

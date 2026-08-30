@@ -90,6 +90,23 @@ export type LinearbotOptions = {
   apiKey?: string;
   apiUrl: string;
   /**
+   * Assignment turns allowed in flight at once — this ingress's share of a
+   * sandbox fleet shared with githubbot, slackbot and the console. Shares are
+   * meant to oversubscribe (x/y/z across n pods, summing past n) so a quiet
+   * ingress leaves its pods usable, which makes the number a deployment-wide
+   * decision. Defaults to 0: unbounded, deferring to the fleet's own admission
+   * limit rather than inventing a second one here. Surplus turns queue; they
+   * are not dropped.
+   */
+  assignmentConcurrency?: number;
+  /**
+   * Minimum spacing between consecutive assignment turn starts, plus a random
+   * extra delay in `[0, staggerMs)`. Keeps a burst of Issue webhooks from
+   * hitting sandbox admission, spawning sandboxes, and issuing their first
+   * inference call all on the same instant. Defaults to 250ms; 0 disables it.
+   */
+  assignmentStaggerMs?: number;
+  /**
    * Connect the Postgres state (and initialize the adapter) at startup.
    * Defaults to true; tests pass false to skip the live connect against mock
    * backends.

@@ -49,6 +49,8 @@ const options: LinearbotOptions = {
   apiUrl,
   apiKey: optionalEnv("LINEARBOT_API_KEY"),
   defaultHarnessType: optionalEnv("LINEARBOT_DEFAULT_HARNESS"),
+  assignmentConcurrency: optionalNumberEnv("LINEARBOT_ASSIGNMENT_CONCURRENCY"),
+  assignmentStaggerMs: optionalNumberEnv("LINEARBOT_ASSIGNMENT_STAGGER_MS"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   linearAccessToken,
   linearApiKey,
