@@ -80,11 +80,14 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     let mut runtime = SessionRuntime::new(store.clone(), sandbox_runtime, iron_control.registrar)
         .with_openai_session_title_generator_from_env();
     runtime = runtime.with_personas(args.persona_registry()?);
-    let sandbox_capacity_config = args.sandbox_capacity_config();
+    let sandbox_capacity_config = args.sandbox_capacity_config()?;
     if let Some(config) = sandbox_capacity_config {
         runtime = runtime.with_sandbox_capacity(config);
     }
-    if let Some(config) = args.warm_pool_config(&iron_control.warm_pool_bootstrap_principal) {
+    if let Some(config) = args.warm_pool_config(
+        &iron_control.warm_pool_bootstrap_principal,
+        sandbox_capacity_config,
+    ) {
         runtime = runtime.with_warm_pool(config);
     }
     runtime = runtime.with_default_max_duration_ms(args.execution_max_duration_ms());

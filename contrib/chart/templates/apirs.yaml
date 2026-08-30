@@ -363,6 +363,8 @@ spec:
               value: {{ .Values.apiRs.executionMaxDurationMs | default 0 | int64 | quote }}
             - name: SESSION_SANDBOX_ADMISSION_WAIT_SECS
               value: {{ .Values.apiRs.sandboxAdmissionWaitSecs | default 600 | quote }}
+            - name: SESSION_SANDBOX_MEMORY_BUDGET_GIB
+              value: {{ .Values.apiRs.sandboxMemoryBudgetGib | default 0 | quote }}
             - name: SESSION_SANDBOX_MAX_LIFETIME_SECS
               value: {{ .Values.apiRs.sandboxMaxLifetimeSecs | quote }}
             - name: SESSION_SANDBOX_REAP_INTERVAL_SECS

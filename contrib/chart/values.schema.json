@@ -343,6 +343,7 @@
         "sandboxPausedProxyMarginPods": { "type": "integer", "minimum": 0 },
         "sandboxPausedProxyCap": { "type": "integer", "minimum": 0 },
         "sandboxAdmissionWaitSecs": { "type": "integer", "minimum": 0 },
+        "sandboxMemoryBudgetGib": { "type": "integer", "minimum": 0 },
         "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
         "etl": {

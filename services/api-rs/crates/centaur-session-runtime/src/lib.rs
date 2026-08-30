@@ -172,11 +172,31 @@ pub struct SandboxCapacityConfig {
     /// with `CapacityExceeded`. Zero fails at once, which is the behaviour
     /// before this existed.
     pub admission_wait: Duration,
+    /// Node memory budget in bytes committed to running session sandboxes.
+    /// `None` keeps admission count-only.
+    pub memory_budget_bytes: Option<u64>,
+    /// Memory in bytes one admitted sandbox commits: its agent container
+    /// limit plus the iron-proxy limit it schedules beside it.
+    pub per_sandbox_memory_bytes: Option<u64>,
 }
 
 impl SandboxCapacityConfig {
     pub fn is_enabled(&self) -> bool {
         self.max_running > 0
+    }
+
+    /// Running-sandbox count admission holds: the count limit intersected
+    /// with the memory budget. An unset budget or per-sandbox size leaves
+    /// the count limit in force; the budget is inert then by design, not
+    /// mis-sized.
+    pub fn admission_limit(&self) -> usize {
+        let (Some(budget), Some(per)) = (self.memory_budget_bytes, self.per_sandbox_memory_bytes)
+        else {
+            return self.max_running;
+        };
+        let per = per.max(1);
+        let from_budget = usize::try_from(budget / per).unwrap_or(usize::MAX);
+        self.max_running.min(from_budget)
     }
 }
 
@@ -512,13 +532,19 @@ impl SandboxCapacityController {
                 Ok(()) => return action().await,
                 Err(SessionRuntimeError::CapacityExceeded {
                     max_running,
+                    admission_limit,
                     running,
+                    memory_budget_bytes,
+                    per_sandbox_memory_bytes,
                     ..
                 }) => {
                     if Instant::now() >= deadline {
                         return Err(SessionRuntimeError::CapacityExceeded {
                             max_running,
+                            admission_limit,
                             running,
+                            memory_budget_bytes,
+                            per_sandbox_memory_bytes,
                             operation,
                         });
                     }
@@ -529,6 +555,9 @@ impl SandboxCapacityController {
                             operation,
                             running,
                             max_running,
+                            admission_limit,
+                            memory_budget_bytes,
+                            per_sandbox_memory_bytes,
                             deadline,
                         )
                         .await;
@@ -557,9 +586,24 @@ impl SandboxCapacityController {
         operation: &'static str,
         running: usize,
         max_running: usize,
+        admission_limit: usize,
+        memory_budget_bytes: Option<u64>,
+        per_sandbox_memory_bytes: Option<u64>,
         deadline: Instant,
     ) {
         let wait_secs = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let running_memory_bytes =
+            per_sandbox_memory_bytes.and_then(|per| per.checked_mul(running as u64));
+        let memory_headroom_bytes = match (
+            memory_budget_bytes,
+            per_sandbox_memory_bytes,
+            running_memory_bytes,
+        ) {
+            (Some(budget), Some(per), Some(running_memory)) => {
+                Some(budget.saturating_sub(running_memory).saturating_sub(per))
+            }
+            _ => None,
+        };
         info!(
             component = COMPONENT_SESSION_RUNTIME,
             event = "sandbox_capacity_waiting",
@@ -568,6 +612,11 @@ impl SandboxCapacityController {
             operation,
             running,
             max_running,
+            admission_limit,
+            memory_budget_bytes,
+            per_sandbox_memory_bytes,
+            running_memory_bytes,
+            memory_headroom_bytes,
             wait_secs,
             "waiting for a running sandbox slot"
         );
@@ -583,6 +632,11 @@ impl SandboxCapacityController {
                     "operation": operation,
                     "running": running,
                     "max_running": max_running,
+                    "admission_limit": admission_limit,
+                    "memory_budget_bytes": memory_budget_bytes,
+                    "per_sandbox_memory_bytes": per_sandbox_memory_bytes,
+                    "running_memory_bytes": running_memory_bytes,
+                    "memory_headroom_bytes": memory_headroom_bytes,
                     "wait_secs": wait_secs,
                 }),
             )
@@ -605,12 +659,13 @@ impl SandboxCapacityController {
         trigger_execution_id: &str,
         operation: &'static str,
     ) -> Result<(), SessionRuntimeError> {
+        let limit = self.config.admission_limit();
         let running = self.running_slot_count().await?;
-        if running < self.config.max_running {
+        if running < limit {
             return Ok(());
         }
 
-        let mut slots_needed = running.saturating_sub(self.config.max_running) + 1;
+        let mut slots_needed = running.saturating_sub(limit) + 1;
         let mut stopped_warm = 0usize;
         let mut paused_idle = 0usize;
         let mut stale_candidates_reconciled = 0usize;
@@ -736,9 +791,16 @@ impl SandboxCapacityController {
                 operation,
                 running_before = running,
                 max_running = self.config.max_running,
+                admission_limit = limit,
                 stopped_warm,
                 paused_idle,
                 stale_candidates_reconciled,
+                memory_budget_bytes = self.config.memory_budget_bytes,
+                per_sandbox_memory_bytes = self.config.per_sandbox_memory_bytes,
+                running_memory_bytes = self.config
+                    .per_sandbox_memory_bytes
+                    .and_then(|per| per.checked_mul(running as u64)),
+                memory_headroom_bytes = self.memory_headroom_for_next(running),
                 "admitted sandbox operation under capacity pressure"
             );
             return Ok(());
@@ -746,9 +808,21 @@ impl SandboxCapacityController {
 
         Err(SessionRuntimeError::CapacityExceeded {
             max_running: self.config.max_running,
+            admission_limit: limit,
             running,
+            memory_budget_bytes: self.config.memory_budget_bytes,
+            per_sandbox_memory_bytes: self.config.per_sandbox_memory_bytes,
             operation,
         })
+    }
+
+    /// Budget left for one more sandbox: the memory budget minus what the
+    /// running sandboxes commit and what the admitted one would commit.
+    fn memory_headroom_for_next(&self, running: usize) -> Option<u64> {
+        let budget = self.config.memory_budget_bytes?;
+        let per = self.config.per_sandbox_memory_bytes?;
+        let committed = per.checked_mul(running as u64)?;
+        Some(budget.saturating_sub(committed).saturating_sub(per))
     }
 
     async fn pause_capacity_candidate(
@@ -7268,11 +7342,17 @@ pub enum SessionRuntimeError {
     #[error(transparent)]
     WarmPool(#[from] WarmPoolError),
     #[error(
-        "sandbox running capacity exceeded during {operation}: running={running}, max_running={max_running}"
+        "sandbox running capacity exceeded during {operation}: running={running}, \
+         admission_limit={admission_limit} (max_running={max_running}, \
+         memory_budget_bytes={memory_budget_bytes:?}, \
+         per_sandbox_memory_bytes={per_sandbox_memory_bytes:?})"
     )]
     CapacityExceeded {
         max_running: usize,
+        admission_limit: usize,
         running: usize,
+        memory_budget_bytes: Option<u64>,
+        per_sandbox_memory_bytes: Option<u64>,
         operation: &'static str,
     },
 }
@@ -10499,6 +10579,8 @@ mod adoption_tests {
                 // This test asserts the eviction path, so it must fail at once
                 // rather than wait for a slot that never frees.
                 admission_wait: Duration::ZERO,
+                memory_budget_bytes: None,
+                per_sandbox_memory_bytes: None,
             },
         );
 
@@ -10581,6 +10663,8 @@ mod adoption_tests {
                 max_running: 2,
                 hot_idle_grace: Duration::from_secs(300),
                 admission_wait: Duration::from_secs(30),
+                memory_budget_bytes: None,
+                per_sandbox_memory_bytes: None,
             },
         );
 

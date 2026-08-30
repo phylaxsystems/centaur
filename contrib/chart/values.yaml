@@ -465,6 +465,14 @@ apiRs:
   # nothing surfaces on the originating thread, while the slot it needed
   # usually frees seconds later. 0 fails at once.
   sandboxAdmissionWaitSecs: 600
+  # Memory budget in GiB committed by the running session sandboxes.
+  # Admission enforces the smaller of sandboxRunningLimit and this budget
+  # divided by one sandbox's committed share (sandbox.resources.limits.memory
+  # plus the iron-proxy memory limit each sandbox schedules), and records the
+  # computation in every admission decision. Requires sandboxRunningLimit > 0
+  # and a parseable agent memory limit; a budget that cannot hold one sandbox
+  # fails startup. 0 disables memory-aware admission.
+  sandboxMemoryBudgetGib: 0
   # When true, api-rs upserts the shared iron-control infra role and its
   # backing secrets at startup and on tool-secret reconciliation intervals.
   # Set false when multiple Centaur instances share one console/1Password

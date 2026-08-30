@@ -44,6 +44,8 @@ use crate::{ServerError, activity_summary::ActivitySummaryConfig};
 const SANDBOX_REPOS_MOUNT_PATH: &str = "/home/agent/github";
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 const SLACK_BOT_TOKEN_ENV: &str = "SLACK_BOT_TOKEN";
+/// One GiB in bytes, the unit `SESSION_SANDBOX_MEMORY_BUDGET_GIB` is set in.
+const GIB_BYTES: u64 = 1 << 30;
 
 /// OTLP env always forwarded from the api-rs process into codex sandboxes,
 /// mirroring the Python control plane's `_SANDBOX_PASSTHROUGH_ENV_KEYS`. The
@@ -83,12 +85,15 @@ impl Args {
     pub(crate) fn warm_pool_config(
         &self,
         bootstrap_iron_control_principal: &str,
+        sandbox_capacity: Option<SandboxCapacityConfig>,
     ) -> Option<WarmPoolConfig> {
         self.sandbox
-            .warm_pool_config(bootstrap_iron_control_principal)
+            .warm_pool_config(bootstrap_iron_control_principal, sandbox_capacity)
     }
 
-    pub(crate) fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
+    pub(crate) fn sandbox_capacity_config(
+        &self,
+    ) -> Result<Option<SandboxCapacityConfig>, ServerError> {
         self.sandbox.sandbox_capacity_config()
     }
 
@@ -621,6 +626,18 @@ struct SandboxArgs {
         default_value_t = 600
     )]
     sandbox_admission_wait_secs: u64,
+    /// Node memory budget in GiB committed to the running session sandboxes.
+    /// One sandbox's share is its SESSION_SANDBOX_RESOURCES memory limit plus
+    /// the iron-proxy limit each sandbox schedules, and admission enforces
+    /// the smaller of the running limit and the budget divided by that
+    /// share, logging the computation on every decision. 0 disables
+    /// memory-aware admission.
+    #[arg(
+        long = "session-sandbox-memory-budget-gib",
+        env = "SESSION_SANDBOX_MEMORY_BUDGET_GIB",
+        default_value_t = 0
+    )]
+    sandbox_memory_budget_gib: u64,
     /// Stop any sandbox older than this regardless of status; sessions replace
     /// reaped sandboxes on their next message. 0 disables the max-lifetime
     /// sweep.
@@ -1425,22 +1442,89 @@ impl SandboxArgs {
         self.tools.resolve_tool_dirs()
     }
 
-    fn warm_pool_config(&self, bootstrap_iron_control_principal: &str) -> Option<WarmPoolConfig> {
+    fn warm_pool_config(
+        &self,
+        bootstrap_iron_control_principal: &str,
+        sandbox_capacity: Option<SandboxCapacityConfig>,
+    ) -> Option<WarmPoolConfig> {
         (self.warm_pool_size > 0).then(|| WarmPoolConfig {
             target_size: self.warm_pool_size,
             replenish_interval: Duration::from_secs(self.warm_pool_replenish_interval_secs),
             bootstrap_iron_control_principal: bootstrap_iron_control_principal.to_owned(),
-            max_running_sandboxes: (self.sandbox_running_limit > 0)
-                .then_some(self.sandbox_running_limit),
+            // Warm replenishment creates running pods outside the session
+            // admission controller, so it must honor the same effective cap.
+            max_running_sandboxes: sandbox_capacity.map(|config| config.admission_limit()),
         })
     }
 
-    fn sandbox_capacity_config(&self) -> Option<SandboxCapacityConfig> {
-        (self.sandbox_running_limit > 0).then(|| SandboxCapacityConfig {
+    fn sandbox_capacity_config(&self) -> Result<Option<SandboxCapacityConfig>, ServerError> {
+        if self.sandbox_running_limit == 0 {
+            if self.sandbox_memory_budget_gib > 0 {
+                return Err(ServerError::UnsupportedConfig(
+                    "SESSION_SANDBOX_MEMORY_BUDGET_GIB caps SESSION_SANDBOX_RUNNING_LIMIT admission, it does not replace it: set the running limit to use a memory budget"
+                        .to_owned(),
+                ));
+            }
+            return Ok(None);
+        }
+        let (memory_budget_bytes, per_sandbox_memory_bytes) = self.sandbox_memory_budget_bytes()?;
+        Ok(Some(SandboxCapacityConfig {
             max_running: self.sandbox_running_limit,
             hot_idle_grace: Duration::from_secs(self.sandbox_hot_idle_grace_secs),
             admission_wait: Duration::from_secs(self.sandbox_admission_wait_secs),
-        })
+            memory_budget_bytes,
+            per_sandbox_memory_bytes,
+        }))
+    }
+
+    /// The memory budget and one sandbox's committed share, in bytes. A
+    /// budget without a readable per-sandbox share is a startup error:
+    /// admission that counts only slots while claiming to count memory is
+    /// the failure the budget exists to prevent.
+    fn sandbox_memory_budget_bytes(&self) -> Result<(Option<u64>, Option<u64>), ServerError> {
+        if self.sandbox_memory_budget_gib == 0 {
+            return Ok((None, None));
+        }
+        let agent = resource_requirements(
+            self.sandbox_resources_json.as_deref(),
+            "SESSION_SANDBOX_RESOURCES",
+        )?
+        .ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_MEMORY_BUDGET_GIB needs SESSION_SANDBOX_RESOURCES so admission can size one sandbox against the budget"
+                    .to_owned(),
+            )
+        })?;
+        let agent_bytes = agent
+            .memory_limit_bytes()
+            .ok_or_else(|| {
+                ServerError::UnsupportedConfig(
+                    "SESSION_SANDBOX_MEMORY_BUDGET_GIB needs SESSION_SANDBOX_RESOURCES limits.memory as a whole-byte quantity, for example 32Gi"
+                        .to_owned(),
+                )
+            })?;
+        let proxy_bytes = resource_requirements(
+            self.iron_proxy.resources_json.as_deref(),
+            "KUBERNETES_IRON_PROXY_RESOURCES",
+        )?
+        .and_then(|resources| resources.memory_limit_bytes())
+        .unwrap_or(0);
+        let per_sandbox = agent_bytes.saturating_add(proxy_bytes);
+        let budget = self
+            .sandbox_memory_budget_gib
+            .checked_mul(GIB_BYTES)
+            .ok_or_else(|| {
+                ServerError::UnsupportedConfig(format!(
+                    "SESSION_SANDBOX_MEMORY_BUDGET_GIB overflows bytes: {gib}",
+                    gib = self.sandbox_memory_budget_gib
+                ))
+            })?;
+        if budget < per_sandbox {
+            return Err(ServerError::UnsupportedConfig(format!(
+                "SESSION_SANDBOX_MEMORY_BUDGET_GIB must cover at least one sandbox: the {budget} byte budget is below the {per_sandbox} byte share (agent limit plus iron-proxy limit)"
+            )));
+        }
+        Ok((Some(budget), Some(per_sandbox)))
     }
 
     fn sandbox_reaper_config(&self) -> SandboxReaperConfig {
@@ -3432,5 +3516,106 @@ mod tests {
             placeholders.get("NOUS_API_KEY").map(String::as_str),
             Some("NOUS_API_KEY")
         );
+    }
+
+    #[test]
+    fn memory_budget_sizes_admission_from_pod_limits() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-workload",
+            "codex-app-server",
+            "--session-sandbox-running-limit",
+            "12",
+            "--session-sandbox-warm-pool-size",
+            "3",
+            "--session-sandbox-memory-budget-gib",
+            "100",
+            "--session-sandbox-resources",
+            r#"{"limits":{"memory":"32Gi"}}"#,
+            "--kubernetes-iron-proxy-resources",
+            r#"{"limits":{"memory":"8Gi"}}"#,
+        ])
+        .unwrap();
+
+        let config = args.sandbox_capacity_config().unwrap().unwrap();
+        assert_eq!(config.max_running, 12);
+        assert_eq!(config.memory_budget_bytes, Some(100 * GIB_BYTES));
+        // 32Gi agent limit plus the 8Gi iron-proxy limit each sandbox
+        // schedules beside it.
+        assert_eq!(config.per_sandbox_memory_bytes, Some(40 * GIB_BYTES));
+        assert_eq!(config.admission_limit(), 2);
+        let warm = args.warm_pool_config("prn_test", Some(config)).unwrap();
+        assert_eq!(warm.max_running_sandboxes, Some(2));
+    }
+
+    #[test]
+    fn sandbox_capacity_config_stays_count_only_without_a_budget() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-running-limit",
+            "12",
+        ])
+        .unwrap();
+
+        let config = args.sandbox_capacity_config().unwrap().unwrap();
+        assert_eq!(config.memory_budget_bytes, None);
+        assert_eq!(config.per_sandbox_memory_bytes, None);
+        assert_eq!(config.admission_limit(), 12);
+    }
+
+    #[test]
+    fn memory_budget_requires_a_running_limit() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-memory-budget-gib",
+            "100",
+            "--session-sandbox-resources",
+            r#"{"limits":{"memory":"32Gi"}}"#,
+        ])
+        .unwrap();
+
+        assert!(args.sandbox_capacity_config().is_err());
+    }
+
+    #[test]
+    fn memory_budget_requires_a_readable_agent_limit() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-running-limit",
+            "12",
+            "--session-sandbox-memory-budget-gib",
+            "100",
+        ])
+        .unwrap();
+
+        assert!(args.sandbox_capacity_config().is_err());
+    }
+
+    #[test]
+    fn memory_budget_below_one_sandbox_share_rejects_startup() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-running-limit",
+            "12",
+            "--session-sandbox-memory-budget-gib",
+            "1",
+            "--session-sandbox-resources",
+            r#"{"limits":{"memory":"32Gi"}}"#,
+            "--kubernetes-iron-proxy-resources",
+            r#"{"limits":{"memory":"8Gi"}}"#,
+        ])
+        .unwrap();
+
+        assert!(args.sandbox_capacity_config().is_err());
     }
 }
