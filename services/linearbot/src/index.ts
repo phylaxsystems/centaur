@@ -22,6 +22,7 @@ import pg from "pg";
 import {
   parseIssueAssignmentWebhook,
   parseIssueCommentWebhook,
+  parseIssueReleaseWebhook,
   type IssueAssignmentEvent,
   type IssueCommentEvent,
 } from "./issue-comments";
@@ -60,6 +61,7 @@ import { extractMessageOverrides, resolveStickyProvider } from "./overrides";
 import {
   executeSessionTurn,
   forwardToSessionApi,
+  interruptSession,
   isRetryableSessionApiError,
   openSessionEventStream,
   serializeMessage,
@@ -244,6 +246,9 @@ export function createLinearbot(options: LinearbotOptions): Linearbot {
         ) ??
         requestContext.run(context, () =>
           handleIssueAssignment(rawBody, handlerInput),
+        ) ??
+        requestContext.run(context, () =>
+          handleIssueRelease(rawBody, handlerInput),
         );
       if (handled) handoffTasks.push(handled);
       try {
@@ -685,6 +690,52 @@ function assignmentGateFor(options: LinearbotOptions): AssignmentGate {
   return assignmentGate;
 }
 
+const RELEASE_INTERRUPT_REASON =
+  "The issue was taken back from the bot while this turn was running.";
+const RELEASE_INTERRUPT_RETRY_MS = 250;
+const RELEASE_INTERRUPT_RETRY_ATTEMPTS = 40;
+
+/**
+ * Assignment turns still owed a start, by thread key.
+ *
+ * A turn is not instantaneous: it waits its place among concurrent handoffs,
+ * then spends seconds fetching issue context and spawning a sandbox. Somebody
+ * can take the issue back inside that window, and the release path needs to
+ * tell "not started yet, so drop it" from "already running, so interrupt it" —
+ * a dropped turn leaves nothing behind, while an interrupt has a sandbox and a
+ * half-written comment to account for.
+ *
+ * Per process, like the work it tracks. A restart loses the entries, which
+ * costs nothing: it also loses the turns.
+ */
+const pendingAssignments = new Map<string, Set<PendingAssignment>>();
+
+type PendingAssignment = {
+  /** Set when the issue is taken back before the turn starts. */
+  released: boolean;
+  /** Set once the turn is actually running. */
+  started: boolean;
+};
+
+function registerPendingAssignment(threadKey: string): PendingAssignment {
+  const pending = { released: false, started: false };
+  const assignments =
+    pendingAssignments.get(threadKey) ?? new Set<PendingAssignment>();
+  assignments.add(pending);
+  pendingAssignments.set(threadKey, assignments);
+  return pending;
+}
+
+function unregisterPendingAssignment(
+  threadKey: string,
+  pending: PendingAssignment,
+): void {
+  const assignments = pendingAssignments.get(threadKey);
+  if (!assignments) return;
+  assignments.delete(pending);
+  if (assignments.size === 0) pendingAssignments.delete(threadKey);
+}
+
 function handleIssueAssignment(
   rawBody: string,
   input: ThreadHandlerInput,
@@ -702,52 +753,205 @@ function handleIssueAssignment(
     startedAtMs: nowMs(),
     threadId: threadKey,
   };
+  // Register synchronously, before thread-state I/O, so a release webhook
+  // arriving while assignment dedupe is loading can still cancel this turn.
+  const pending = registerPendingAssignment(threadKey);
   return (async () => {
-    const thread = chat.thread(threadKey);
-    const threadState = (await thread.state) ?? {};
-    if (
-      event.updatedAt &&
-      threadState.lastAssignmentTrigger === event.updatedAt
-    ) {
-      traceLog(options, "linearbot_assignment_duplicate_skipped", trace, {
+    try {
+      const thread = chat.thread(threadKey);
+      const threadState = (await thread.state) ?? {};
+      if (
+        event.updatedAt &&
+        threadState.lastAssignmentTrigger === event.updatedAt
+      ) {
+        traceLog(options, "linearbot_assignment_duplicate_skipped", trace, {
+          issue_id: event.issueId,
+        });
+        unregisterPendingAssignment(threadKey, pending);
+        return;
+      }
+      await thread.setState({ lastAssignmentTrigger: event.updatedAt });
+      const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
+        .linearClient;
+      backgroundWaitUntil(
+        assignmentGateFor(options)
+          .run(
+            async () => {
+              if (pending.released) {
+                // Taken back while this waited for the assignment gate. No
+                // sandbox or live reply exists, so dropping it is sufficient.
+                traceLog(
+                  options,
+                  "linearbot_assignment_dropped_on_release",
+                  trace,
+                  { issue_id: event.issueId },
+                );
+                return;
+              }
+              pending.started = true;
+              await runThreadTurn({
+                abortRequested: () => pending.released,
+                announceStart: true,
+                applyStatus: true,
+                botUserId: input.botUserId,
+                client,
+                executeMessage: assignmentInstructionMessage(
+                  event,
+                  threadKey,
+                  options,
+                ),
+                issueId: event.issueId,
+                options,
+                overrides: {
+                  reasoning: reasoningEffortFor(
+                    options.reasoningEffort,
+                    "assignment",
+                  ),
+                },
+                thread,
+                threadKey,
+                trace,
+              });
+            },
+            (queuedAhead) => {
+              traceLog(options, "linearbot_assignment_queued", trace, {
+                issue_id: event.issueId,
+                queued_ahead: queuedAhead,
+              });
+              announceAssignmentQueued(client, event.issueId, options);
+            },
+          )
+          .finally(() => unregisterPendingAssignment(threadKey, pending)),
+      );
+    } catch (error) {
+      unregisterPendingAssignment(threadKey, pending);
+      throw error;
+    }
+  })();
+}
+
+/**
+ * Stops work on an issue the bot no longer holds.
+ *
+ * Two shapes, and they need different handling. A turn still waiting to start
+ * is dropped where it stands: nothing has been posted, no sandbox exists, and
+ * the cheapest correct thing is to never start. A turn already running is
+ * interrupted through api-rs, which ends the execution and lets the sandbox
+ * fall to the usual idle reclaim instead of holding a fleet slot to the end of
+ * work nobody asked for any more.
+ *
+ * Interrupting is also right when this process knows nothing about the thread:
+ * a turn started before a restart is exactly the case where the issue looks
+ * busy and no local state explains it.
+ *
+ * The issue's status is left alone deliberately. Whoever took the issue back
+ * decides where it belongs; moving it here would fight them.
+ */
+function handleIssueRelease(
+  rawBody: string,
+  input: ThreadHandlerInput,
+): Promise<void> | null {
+  if (!input.botUserId) return null;
+  const event = parseIssueReleaseWebhook(rawBody, input.botUserId);
+  if (!event) return null;
+  const { options } = input;
+  const threadKey = `linear:${event.issueId}`;
+  const trace: LinearbotTrace = {
+    includeContext: false,
+    messageId: `release-${event.issueId}-${event.updatedAt}`,
+    mode: "execute",
+    openStream: false,
+    startedAtMs: nowMs(),
+    threadId: threadKey,
+  };
+  return (async () => {
+    const pending = pendingAssignments.get(threadKey);
+    if (pending) {
+      for (const assignment of pending) assignment.released = true;
+    }
+    if (pending && ![...pending].some((assignment) => assignment.started)) {
+      traceLog(options, "linearbot_assignment_release_pending", trace, {
         issue_id: event.issueId,
       });
       return;
     }
-    await thread.setState({ lastAssignmentTrigger: event.updatedAt });
-    const client = (thread.adapter as unknown as LinearSessionCapableAdapter)
-      .linearClient;
-    backgroundWaitUntil(
-      assignmentGateFor(options).run(
-        () =>
-          runThreadTurn({
-            announceStart: true,
-            applyStatus: true,
-            botUserId: input.botUserId,
-            client,
-            executeMessage: assignmentInstructionMessage(event, threadKey, options),
-            issueId: event.issueId,
+    try {
+      const interrupted = await interruptSession(
+        options,
+        threadKey,
+        RELEASE_INTERRUPT_REASON,
+      );
+      traceLog(options, "linearbot_assignment_release_interrupted", trace, {
+        interrupted,
+        issue_id: event.issueId,
+      });
+      if (!interrupted && pending) {
+        backgroundWaitUntil(
+          retryReleasedAssignmentInterrupt(
             options,
-            overrides: {
-              reasoning: reasoningEffortFor(
-                options.reasoningEffort,
-                "assignment",
-              ),
-            },
-            thread,
             threadKey,
+            event.issueId,
             trace,
-          }),
-        (queuedAhead) => {
-          traceLog(options, "linearbot_assignment_queued", trace, {
-            issue_id: event.issueId,
-            queued_ahead: queuedAhead,
-          });
-          announceAssignmentQueued(client, event.issueId, options);
-        },
-      ),
-    );
+          ),
+        );
+      }
+    } catch (error) {
+      (options.logger ?? noopLogger).warn("linearbot_assignment_release_failed", {
+        error: errorMessage(error),
+        issue_id: event.issueId,
+      });
+    }
   })();
+}
+
+/**
+ * Close the small race between beginning a turn locally and api-rs recording
+ * its execution. The first interrupt can legitimately find nothing while the
+ * execute request is still in flight; retry only while the released assignment
+ * remains active, then stop as soon as api-rs confirms the interrupt.
+ */
+async function retryReleasedAssignmentInterrupt(
+  options: LinearbotOptions,
+  threadKey: string,
+  issueId: string,
+  trace: LinearbotTrace,
+): Promise<void> {
+  for (let attempt = 1; attempt <= RELEASE_INTERRUPT_RETRY_ATTEMPTS; attempt++) {
+    await sleep(RELEASE_INTERRUPT_RETRY_MS);
+    const assignments = pendingAssignments.get(threadKey);
+    if (
+      !assignments ||
+      ![...assignments].some(
+        (assignment) => assignment.released && assignment.started,
+      )
+    ) {
+      return;
+    }
+    try {
+      if (await interruptSession(options, threadKey, RELEASE_INTERRUPT_REASON)) {
+        traceLog(options, "linearbot_assignment_release_interrupted", trace, {
+          interrupted: true,
+          interrupt_attempt: attempt + 1,
+          issue_id: issueId,
+        });
+        return;
+      }
+    } catch (error) {
+      (options.logger ?? noopLogger).warn(
+        "linearbot_assignment_release_retry_failed",
+        {
+          error: errorMessage(error),
+          interrupt_attempt: attempt + 1,
+          issue_id: issueId,
+        },
+      );
+      return;
+    }
+  }
+  (options.logger ?? noopLogger).warn(
+    "linearbot_assignment_release_interrupt_exhausted",
+    { issue_id: issueId },
+  );
 }
 
 /**
@@ -759,6 +963,8 @@ function handleIssueAssignment(
  * retry on transient (cold-start) failures; a hard failure shows an error.
  */
 async function runThreadTurn(input: {
+  /** Assignment release signal; comment turns leave this unset. */
+  abortRequested?: () => boolean;
   /**
    * Post the reply (and move the issue to In Progress) the moment work starts,
    * before any thought streams — for assignment turns, which have no triggering
@@ -787,6 +993,7 @@ async function runThreadTurn(input: {
   trace: LinearbotTrace;
 }): Promise<void> {
   const {
+    abortRequested,
     announceStart,
     applyStatus,
     botUserId,
@@ -802,6 +1009,7 @@ async function runThreadTurn(input: {
     trace,
   } = input;
   const logger = options.logger ?? noopLogger;
+  if (abortRequested?.()) return;
   // Instant 👀 ack on the triggering comment while the bot works (best-effort).
   let workingReactionId: string | undefined;
   if (client && reactCommentId) {
@@ -833,6 +1041,12 @@ async function runThreadTurn(input: {
   const issueContext = client
     ? await fetchLinearIssueContext(client, issueId, logger)
     : null;
+  if (abortRequested?.()) {
+    traceLog(options, "linearbot_assignment_dropped_on_release", trace, {
+      issue_id: issueId,
+    });
+    return;
+  }
   // "Owned" = handed to the bot via the assignment turn (applyStatus) OR the
   // issue is delegated to the bot (true on a comment turn too, e.g. a question
   // on a delegated issue). Ownership injects the work-it-forward contract
@@ -944,6 +1158,12 @@ async function runThreadTurn(input: {
   // Assignment turns have no triggering comment to react to, so post the reply
   // up front as the "I've started" signal — the chain of thought then fills in
   // live (renderThinking) and the answer takes over when the run settles.
+  if (abortRequested?.()) {
+    traceLog(options, "linearbot_assignment_dropped_on_release", trace, {
+      issue_id: issueId,
+    });
+    return;
+  }
   if (announceStart && client) {
     livePostStarted = true;
     lastLiveLineCount = 0;
@@ -961,17 +1181,39 @@ async function runThreadTurn(input: {
     }
   }
 
+  const stopIfReleasedBeforeExecution = async (): Promise<boolean> => {
+    if (!abortRequested?.()) return false;
+    traceLog(options, "linearbot_assignment_dropped_on_release", trace, {
+      issue_id: issueId,
+    });
+    if (client && liveCommentId) {
+      try {
+        await updateIssueReply(client, {
+          body: "Work stopped because this issue was taken back from the bot.",
+          commentId: liveCommentId,
+        });
+      } catch (error) {
+        logger.debug("linearbot_release_reply_update_failed", {
+          error: errorMessage(error),
+        });
+      }
+    }
+    return true;
+  };
+
   let body: string | undefined;
   let marker: LinearStatusMarker | undefined;
   let failed = false;
   for (let attempt = 0; attempt <= THREAD_TURN_MAX_RETRIES; attempt++) {
     try {
+      if (await stopIfReleasedBeforeExecution()) return;
       // create + append context (idempotent), then execute + stream.
       await forwardToSessionApi(
         options,
         { ...forwardInput, executeMessage: undefined, openStream: false },
         {},
       );
+      if (await stopIfReleasedBeforeExecution()) return;
       const collector = new CommentReplyCollector();
       const fallback = new LinearRenderFallback();
       for await (const chunk of harnessToChatSdkStream(
