@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend, SandboxError, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -66,6 +66,15 @@ pub struct AgentSandboxConfig {
     pub namespace: String,
     pub field_manager: String,
     pub container_name: String,
+    /// Fleet-policy resources for the agent container, as currently configured.
+    ///
+    /// The CR stores the pod template rendered at create, and every pod
+    /// recreation re-renders from that stored template, so a session created
+    /// before a resources change keeps the old limits for its whole life --
+    /// including across pod replacement. Reconciling on resume is what lets a
+    /// values change reach an existing session without destroying its CR (and
+    /// with it, its workspace).
+    pub default_resources: Option<ResourceRequirements>,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub image_pull_policy: Option<String>,
@@ -143,6 +152,7 @@ impl AgentSandboxConfig {
             namespace: namespace.into(),
             field_manager: "centaur-api-rs".to_owned(),
             container_name: DEFAULT_CONTAINER_NAME.to_owned(),
+            default_resources: None,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             image_pull_policy: None,
@@ -279,6 +289,60 @@ impl AgentSandboxBackend {
                 "failed to unwind leaked iron-proxy resources"
             );
         }
+    }
+
+    /// Bring a paused sandbox's stored pod template back in line with the
+    /// currently configured agent resources.
+    ///
+    /// Only the agent container's `resources` is touched. Everything else in
+    /// the template is session identity -- harness args, env, principal
+    /// annotations -- and re-rendering it from current config would rewrite a
+    /// session's own setup underneath it.
+    ///
+    /// Runs on resume, when `replicas` is still 0 and no pod exists, so this
+    /// never restarts a running pod: the reconciled template is what the next
+    /// pod is built from.
+    async fn reconcile_sandbox_resources(
+        &self,
+        id: &SandboxId,
+        sandbox: &crd::Sandbox,
+    ) -> SandboxResult<()> {
+        let Some(desired) = self.config.default_resources.as_ref() else {
+            return Ok(());
+        };
+        if desired.is_empty() {
+            return Ok(());
+        }
+        let Some((index, desired_value)) = resources_drift(
+            &sandbox.spec.pod_template.spec.containers,
+            &self.config.container_name,
+            desired,
+        ) else {
+            return Ok(());
+        };
+        // A merge patch on `containers` would replace the whole array, so this
+        // has to be a JSON patch at the container's own index.
+        let patch = json!([{
+            "op": "replace",
+            "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
+            "value": desired_value,
+        }]);
+        self.sandboxes()
+            .patch(
+                id.as_str(),
+                &PatchParams::default(),
+                &Patch::Json::<crd::Sandbox>(serde_json::from_value(patch).map_err(|err| {
+                    SandboxError::backend(format!("build resources patch: {err}"))
+                })?),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| map_kube_error("reconcile sandbox resources", err))?;
+        tracing::info!(
+            sandbox_id = id.as_str(),
+            "reconciled sandbox resources with current configuration"
+        );
+        Ok(())
     }
 
     async fn get_pod(&self, id: &SandboxId) -> SandboxResult<Option<Pod>> {
@@ -695,6 +759,17 @@ impl SandboxBackend for AgentSandboxBackend {
         // The proxy resources were recreated, so re-bind them to the sandbox
         // for cascade deletion.
         let sandbox = self.get_sandbox(id).await?;
+        if let Some(sandbox) = &sandbox
+            && let Err(error) = self.reconcile_sandbox_resources(id, sandbox).await
+        {
+            // A drifted limit is worse than a stale one only if it stops the
+            // resume, so this warns rather than failing the turn.
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to reconcile sandbox resources with current configuration"
+            );
+        }
         match &sandbox {
             Some(sandbox) => {
                 if let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await {
@@ -1249,6 +1324,25 @@ fn sandbox_owner_reference(sandbox: &crd::Sandbox) -> Option<Value> {
         "name": name,
         "uid": uid,
     }))
+}
+
+/// The agent container's index and the desired resources value, when the
+/// stored template has drifted from current configuration.
+///
+/// `None` means nothing to do: no container of that name (do not guess at an
+/// index), or the stored resources already match. Returning the index rather
+/// than patching here keeps the decision testable without a cluster.
+fn resources_drift(
+    containers: &[crd::SandboxPodTemplateSpecContainers],
+    container_name: &str,
+    desired: &ResourceRequirements,
+) -> Option<(usize, Value)> {
+    let index = containers
+        .iter()
+        .position(|container| container.name == container_name)?;
+    let current = serde_json::to_value(&containers[index].resources).unwrap_or(Value::Null);
+    let desired_value = json!(desired);
+    (current != desired_value).then_some((index, desired_value))
 }
 
 fn resources_json(spec: &SandboxSpec) -> Option<Value> {
@@ -2029,5 +2123,64 @@ mod tests {
             pod_termination_reason(&pod_with_phase_and_ready("Running", true)),
             None
         );
+    }
+
+    fn container_with_resources(
+        name: &str,
+        memory: Option<&str>,
+    ) -> crd::SandboxPodTemplateSpecContainers {
+        let resources = memory.map(|memory| {
+            serde_json::from_value(json!({ "limits": { "memory": memory } })).expect("resources")
+        });
+        crd::SandboxPodTemplateSpecContainers {
+            name: name.to_owned(),
+            resources,
+            ..serde_json::from_value(json!({ "name": name })).expect("container")
+        }
+    }
+
+    fn desired_memory(memory: &str) -> ResourceRequirements {
+        let mut requirements = ResourceRequirements::new();
+        requirements
+            .limits
+            .insert("memory".to_owned(), memory.to_owned());
+        requirements
+    }
+
+    #[test]
+    fn resources_drift_reports_the_agent_container_when_stale() {
+        let containers = vec![
+            container_with_resources("init", Some("1Gi")),
+            container_with_resources("agent", Some("24Gi")),
+        ];
+        let (index, value) =
+            resources_drift(&containers, "agent", &desired_memory("32Gi")).expect("drift");
+        // The agent container is not index 0, so the index has to come from
+        // the name rather than being assumed.
+        assert_eq!(index, 1);
+        assert_eq!(value["limits"]["memory"], "32Gi");
+    }
+
+    #[test]
+    fn resources_drift_is_none_when_already_current() {
+        let containers = vec![container_with_resources("agent", Some("32Gi"))];
+        assert!(resources_drift(&containers, "agent", &desired_memory("32Gi")).is_none());
+    }
+
+    /// Guessing an index would rewrite whichever container happened to sit
+    /// there, so an unrecognised name means leave the CR alone.
+    #[test]
+    fn resources_drift_is_none_without_a_matching_container() {
+        let containers = vec![container_with_resources("sidecar", Some("1Gi"))];
+        assert!(resources_drift(&containers, "agent", &desired_memory("32Gi")).is_none());
+    }
+
+    #[test]
+    fn resources_drift_fills_in_a_container_that_has_none() {
+        let containers = vec![container_with_resources("agent", None)];
+        let (index, value) =
+            resources_drift(&containers, "agent", &desired_memory("32Gi")).expect("drift");
+        assert_eq!(index, 0);
+        assert_eq!(value["limits"]["memory"], "32Gi");
     }
 }

@@ -1565,6 +1565,12 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .map(str::to_owned)
             .collect();
         config.node_selector = args.node_selector()?;
+        // The same value the create path renders into a new sandbox's pod
+        // template, so resume can bring an older CR back in line with it.
+        config.default_resources = resource_requirements(
+            args.sandbox_resources_json.as_deref(),
+            "SESSION_SANDBOX_RESOURCES",
+        )?;
         config.tolerations = args.tolerations()?;
         config.runtime_class_name = args
             .runtime_class_name
