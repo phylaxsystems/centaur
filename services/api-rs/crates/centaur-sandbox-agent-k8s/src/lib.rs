@@ -29,10 +29,15 @@ use tokio::time::{Instant, sleep};
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
 pub use k8s_openapi::api::core::v1::Toleration;
+pub use paused_proxy_retention::{
+    NodePodBudget, PausedProxyRetentionConfig, PausedProxyRetentionReport,
+    PausedProxyRetentionSweep, RetainedPausedProxy, select_evictions,
+};
 pub use tools::{GitHubTokenRef, ToolSource, ToolsConfig};
 
 pub mod generated;
 mod iron_proxy;
+mod paused_proxy_retention;
 mod tools;
 
 const BACKEND_NAME: &str = "agent-sandbox-k8s";
@@ -97,6 +102,10 @@ pub struct AgentSandboxConfig {
     /// the per-sandbox proxy uses this target for its own explicit egress.
     pub otlp_egress: Option<OtlpEgressTarget>,
     pub ready_timeout: Duration,
+    /// Retention policy for paused sandboxes' iron-proxy pods. The sweep
+    /// bounds how many of them a node keeps so they cannot crowd out the
+    /// agent and proxy pods new sandboxes need to schedule.
+    pub paused_proxy_retention: PausedProxyRetentionConfig,
 }
 
 /// Destination of the sandbox's direct OTLP export, expressed as the target
@@ -149,6 +158,7 @@ impl AgentSandboxConfig {
             tools: None,
             otlp_egress: None,
             ready_timeout: Duration::from_secs(60),
+            paused_proxy_retention: PausedProxyRetentionConfig::default(),
         }
     }
 
@@ -197,6 +207,9 @@ pub struct AgentSandboxBackend {
     // sandbox id -> iron-control proxy OID, so the proxy can be deregistered on
     // stop. Only populated for sync-mode sandboxes.
     proxy_ids: Arc<Mutex<HashMap<String, String>>>,
+    // Sandbox ids whose resume is rebuilding their proxy right now, so the
+    // paused-proxy retention sweep leaves those rebuilds alone.
+    resuming: Arc<std::sync::Mutex<BTreeSet<String>>>,
 }
 
 impl AgentSandboxBackend {
@@ -205,6 +218,16 @@ impl AgentSandboxBackend {
             client,
             config,
             proxy_ids: Arc::new(Mutex::new(HashMap::new())),
+            resuming: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    /// Sandbox ids whose resume is rebuilding their proxy. The paused-proxy
+    /// retention sweep consults this so it never evicts a proxy mid-resume.
+    pub(crate) fn resuming_sandbox_ids(&self) -> BTreeSet<String> {
+        match self.resuming.lock() {
+            Ok(set) => set.clone(),
+            Err(_) => BTreeSet::new(),
         }
     }
 
@@ -654,6 +677,13 @@ impl SandboxBackend for AgentSandboxBackend {
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
         // Resume only has the sandbox id, not the spec, so rebind the proxy to
         // the principal recorded at create rather than re-resolving from spec.
+        if let Ok(mut resuming) = self.resuming.lock() {
+            resuming.insert(id.as_str().to_owned());
+        }
+        let _resume_guard = ResumeGuard {
+            set: self.resuming.as_ref(),
+            id: id.as_str().to_owned(),
+        };
         let resolved_iron_proxy = self.resolve_iron_proxy_for_resume(id).await?;
         if let Err(err) = self
             .create_iron_proxy_resources(id, resolved_iron_proxy.as_ref())
@@ -697,6 +727,21 @@ impl SandboxBackend for AgentSandboxBackend {
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
         self.wait_until_running(id).await
+    }
+}
+
+/// Clears the in-resume mark when a resume attempt ends, whatever its
+/// outcome, so the paused-proxy retention sweep evicts it again.
+struct ResumeGuard<'a> {
+    set: &'a std::sync::Mutex<BTreeSet<String>>,
+    id: String,
+}
+
+impl Drop for ResumeGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.id);
+        }
     }
 }
 

@@ -28,7 +28,7 @@ use crate::{
     OtlpEgressTarget, SANDBOX_ID_LABEL, is_not_found, map_kube_error,
 };
 
-const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
+pub(crate) const IRON_PROXY_LABEL: &str = "centaur.ai/iron-proxy";
 const IRON_CONTROL_PROXY_ID_ANNOTATION: &str = "centaur.ai/iron-control-proxy-id";
 /// How long a labeled iron-proxy resource must survive with no live
 /// Sandbox before the orphan sweep may delete it. Creates and resumes build
@@ -1078,7 +1078,10 @@ impl AgentSandboxBackend {
             .find_map(proxy_management_endpoint_from_pod))
     }
 
-    async fn proxy_id_for_sandbox(&self, id: &SandboxId) -> SandboxResult<Option<String>> {
+    pub(crate) async fn proxy_id_for_sandbox(
+        &self,
+        id: &SandboxId,
+    ) -> SandboxResult<Option<String>> {
         if let Some(proxy_id) = self.proxy_ids.lock().await.get(id.as_str()).cloned() {
             return Ok(Some(proxy_id));
         }

@@ -25,7 +25,8 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, Toleration, ToolSource, ToolsConfig,
+    OtlpEgressTarget, PausedProxyRetentionConfig, PausedProxyRetentionSweep, Toleration,
+    ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -658,6 +659,30 @@ struct SandboxArgs {
         default_value_t = 21_600
     )]
     sandbox_idle_cleanup_backstop_secs: u64,
+    /// How often to evict the longest-paused sandboxes' iron-proxy pods when
+    /// a node runs out of pod slots for them. 0 disables the sweep.
+    #[arg(
+        long = "session-sandbox-paused-proxy-sweep-interval-secs",
+        env = "SESSION_SANDBOX_PAUSED_PROXY_SWEEP_INTERVAL_SECS",
+        default_value_t = 300
+    )]
+    sandbox_paused_proxy_sweep_interval_secs: u64,
+    /// Pod slots each node keeps free beyond its current load, covering the
+    /// agent pod and proxy pod a new sandbox needs to schedule.
+    #[arg(
+        long = "session-sandbox-paused-proxy-margin-pods",
+        env = "SESSION_SANDBOX_PAUSED_PROXY_MARGIN_PODS",
+        default_value_t = 2
+    )]
+    sandbox_paused_proxy_margin_pods: usize,
+    /// Absolute ceiling on paused sandboxes that keep their proxy. 0 leaves
+    /// the ceiling to node capacity.
+    #[arg(
+        long = "session-sandbox-paused-proxy-cap",
+        env = "SESSION_SANDBOX_PAUSED_PROXY_CAP",
+        default_value_t = 0
+    )]
+    sandbox_paused_proxy_cap: usize,
     #[arg(
         long = "session-sandbox-k8s-context",
         alias = "kubernetes-context",
@@ -843,10 +868,14 @@ impl SandboxArgs {
                 self.local_workload_mode()?,
             )),
             SandboxBackendKind::AgentK8s => {
-                let backend = AgentSandboxBackend::new(
+                let backend = Arc::new(AgentSandboxBackend::new(
                     self.kube_client().await?,
                     AgentSandboxConfig::try_from(self)?,
-                );
+                ));
+                // The sweep bounds the paused proxies this runtime creates,
+                // so it is owned here rather than by the workflow-host
+                // runtime, which drives a single long-lived sandbox.
+                PausedProxyRetentionSweep::new(backend.clone()).spawn();
                 let stopped = backend.drain_service_account_mismatches().await?;
                 if !stopped.is_empty() {
                     info!(
@@ -855,7 +884,7 @@ impl SandboxArgs {
                     );
                 }
                 Ok(SandboxRuntime::backend_with_workload(
-                    Arc::new(backend),
+                    backend,
                     self.container_workload_mode()?,
                 ))
             }
@@ -1556,6 +1585,12 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         // The chart label policy handles sandbox OTLP egress; keep the
         // per-sandbox proxy's own in-cluster OTLP egress explicit.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
+        config.paused_proxy_retention = PausedProxyRetentionConfig {
+            interval: (args.sandbox_paused_proxy_sweep_interval_secs > 0)
+                .then(|| Duration::from_secs(args.sandbox_paused_proxy_sweep_interval_secs)),
+            margin_pods: args.sandbox_paused_proxy_margin_pods,
+            cap: (args.sandbox_paused_proxy_cap > 0).then_some(args.sandbox_paused_proxy_cap),
+        };
         Ok(config)
     }
 }
@@ -2945,6 +2980,40 @@ mod tests {
         assert!(args.sandbox.tolerations().unwrap().is_empty());
         assert!(args.sandbox.service_account_name.is_none());
         assert!(args.sandbox.priority_class_name.is_none());
+    }
+
+    #[test]
+    fn paused_proxy_retention_parses_from_args() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--session-sandbox-paused-proxy-sweep-interval-secs",
+            "60",
+            "--session-sandbox-paused-proxy-margin-pods",
+            "4",
+            "--session-sandbox-paused-proxy-cap",
+            "25",
+        ])
+        .unwrap();
+
+        assert_eq!(args.sandbox.sandbox_paused_proxy_sweep_interval_secs, 60);
+        assert_eq!(args.sandbox.sandbox_paused_proxy_margin_pods, 4);
+        assert_eq!(args.sandbox.sandbox_paused_proxy_cap, 25);
+    }
+
+    #[test]
+    fn paused_proxy_retention_defaults() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        assert_eq!(args.sandbox.sandbox_paused_proxy_sweep_interval_secs, 300);
+        assert_eq!(args.sandbox.sandbox_paused_proxy_margin_pods, 2);
+        assert_eq!(args.sandbox.sandbox_paused_proxy_cap, 0);
     }
 
     /// Unlike `SESSION_SANDBOX_EXTRA_ENV`, bad node steering fails startup:
