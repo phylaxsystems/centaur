@@ -540,6 +540,16 @@ apiRs:
   sessionEventsRetentionDays: 0
   sandboxCleanupIntervalSecs: 300
   sandboxIdleCleanupBackstopSecs: 21600 # 6 hours
+  # Paused-proxy retention sweep: paused sandboxes keep their iron-proxy pod
+  # for fast resume, and this sweep bounds how many a node holds against its
+  # allocatable pod count, evicting the longest-paused first so new sandbox
+  # pods can always schedule. 0 on the interval disables the sweep.
+  # marginPods is the pod headroom kept free per node (a new sandbox
+  # schedules one agent pod and one proxy pod). cap is an absolute ceiling on
+  # retained proxies; 0 sizes the ceiling from node capacity alone.
+  sandboxPausedProxySweepIntervalSecs: 300
+  sandboxPausedProxyMarginPods: 2
+  sandboxPausedProxyCap: 0
   activitySummary:
     enabled: false
     model: gpt-5.4-nano

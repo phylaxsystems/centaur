@@ -338,6 +338,9 @@
         "mcpPublicUrl": { "type": "string" },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
         "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
+        "sandboxPausedProxySweepIntervalSecs": { "type": "integer", "minimum": 0 },
+        "sandboxPausedProxyMarginPods": { "type": "integer", "minimum": 0 },
+        "sandboxPausedProxyCap": { "type": "integer", "minimum": 0 },
         "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
         "etl": {

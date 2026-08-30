@@ -133,9 +133,15 @@ Sandbox lifecycle:
 | `apiRs.sandboxReapIntervalSecs` / `SESSION_SANDBOX_REAP_INTERVAL_SECS` | Helm value, default `300`. | How often api-rs sweeps observed sandboxes for max-lifetime expiry. |
 | `apiRs.activitySummary.reasoningEffort` / `SESSION_ACTIVITY_SUMMARY_REASONING_EFFORT` | Helm value, default `low`. | Reasoning effort sent with the activity-summary call. The output budget is small, so a server that resolves an absent effort to its highest level spends the whole budget reasoning and returns an `incomplete` response with no message. Set empty to omit the parameter for a server that rejects it. |
 | `SESSION_TITLE_REASONING_EFFORT` | Env on api-rs, default `low`. | The same, for the session-title call, whose budget is 24 output tokens. Set empty to omit the parameter. |
+| `apiRs.sandboxPausedProxySweepIntervalSecs` / `SESSION_SANDBOX_PAUSED_PROXY_SWEEP_INTERVAL_SECS` | Helm value, default `300`. | Paused-proxy retention sweep interval. Paused sandboxes keep their iron-proxy pod for fast resume; this sweep evicts the longest-paused proxies when a node runs out of pod slots for them, so new sandbox pods keep scheduling. `0` disables the sweep. |
+| `apiRs.sandboxPausedProxyMarginPods` / `SESSION_SANDBOX_PAUSED_PROXY_MARGIN_PODS` | Helm value, default `2`. | Pod headroom each node keeps free beyond its current load, covering the agent pod and proxy pod a new sandbox schedules. |
+| `apiRs.sandboxPausedProxyCap` / `SESSION_SANDBOX_PAUSED_PROXY_CAP` | Helm value, default `0` (none). | Absolute ceiling on retained paused proxies; `0` sizes the ceiling from node capacity alone. |
 
 There is no separate suspended-only delete timer. Pausing is controlled by the
 per-execution idle timeout; deletion is controlled by sandbox max lifetime.
+Evicting a paused proxy is not deletion: the sandbox CR survives and resume
+recreates the proxy, so only the evicted session's resume pays a
+cold-create.
 
 Execution tuning:
 

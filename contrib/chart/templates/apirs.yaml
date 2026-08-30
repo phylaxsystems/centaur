@@ -178,6 +178,34 @@ roleRef:
   kind: Role
   name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-manager") }}
 ---
+# Read-only cluster census for the paused-proxy retention sweep: it sizes
+# proxy eviction against each steering node's allocatable pod count, which
+# the namespace-scoped Role above cannot see.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-node-budget") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-node-budget") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $apiRsName }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-node-budget") }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -341,6 +369,15 @@ spec:
               value: {{ .Values.apiRs.sandboxCleanupIntervalSecs | quote }}
             - name: SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS
               value: {{ .Values.apiRs.sandboxIdleCleanupBackstopSecs | quote }}
+            # Paused-proxy retention sweep. api-rs needs read-only cluster
+            # pods+nodes to size proxy eviction against each node's
+            # allocatable pod count (see the ClusterRole above).
+            - name: SESSION_SANDBOX_PAUSED_PROXY_SWEEP_INTERVAL_SECS
+              value: {{ .Values.apiRs.sandboxPausedProxySweepIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_PAUSED_PROXY_MARGIN_PODS
+              value: {{ .Values.apiRs.sandboxPausedProxyMarginPods | quote }}
+            - name: SESSION_SANDBOX_PAUSED_PROXY_CAP
+              value: {{ .Values.apiRs.sandboxPausedProxyCap | quote }}
             - name: SESSION_ACTIVITY_SUMMARY_ENABLED
               value: {{ .Values.apiRs.activitySummary.enabled | quote }}
 {{- if .Values.apiRs.activitySummary.enabled }}
