@@ -3,7 +3,7 @@ import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import { reviewThreadKey } from "./review";
-import { forwardToSessionApi } from "./session-api";
+import { appendToExistingSession } from "./session-api";
 import { runTurnStream, turnOutputChars } from "./turn";
 import {
   fetchCiEvaluation,
@@ -333,9 +333,10 @@ export async function handlePullRequestEvent(
  * Tell the PR's sessions that it closed.
  *
  * Delivered as an appended message rather than a turn: this is context for
- * whatever is already running, not new work. `forwardToSessionApi` with no
- * `executeMessage` appends and returns without starting an execution, so this
- * consumes no sandbox slot.
+ * whatever is already running, not new work. The append first checks that the
+ * session exists, so an unrelated PR close cannot manufacture empty management
+ * and review sessions. No execution is started, so this consumes no sandbox
+ * slot.
  *
  * Both PR-scoped threads are notified. A close matters to the management turn
  * driving CI and merges, and to a review-response turn addressing feedback on
@@ -364,16 +365,18 @@ async function notifyPullRequestClosed(
   ];
   for (const threadKey of threadKeys) {
     try {
-      await forwardToSessionApi(ctx.options, {
-        afterEventId: 0,
-        conversationName: `${slug}: ${title}`,
-        messages: [managementMessage(id, threadKey, text)],
-        // Append-only: no execution is started, so no event stream to follow.
-        onEventId: () => {},
-        openStream: false,
-        threadId: threadKey,
-        trace: makeTrace(threadKey, id),
-      });
+      const appended = await appendToExistingSession(ctx.options, threadKey, [
+        managementMessage(id, threadKey, text),
+      ]);
+      if (!appended) {
+        traceLog(
+          ctx.options,
+          "githubbot_pr_closed_session_missing",
+          makeTrace(threadKey, id),
+          { merged, pr: slug },
+        );
+        continue;
+      }
       traceLog(
         ctx.options,
         "githubbot_pr_closed_notified",

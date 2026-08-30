@@ -953,17 +953,27 @@ describe("management turn reaction ack", () => {
 });
 
 describe("pull request closed", () => {
-  function closeCtx(calls: { url: string; body: unknown }[]) {
+  type CloseCall = { url: string; method: string; body: unknown };
+
+  function closeCtx(calls: CloseCall[], sessionsExist = true) {
     return {
       octokit: { rest: { pulls: { get: async () => ({ data: {} }) } } },
       options: {
         apiUrl: "http://localhost",
         logger: { debug() {}, warn() {}, error() {}, info() {} },
-        fetch: async (url: string, init?: { body?: string }) => {
+        fetch: async (
+          url: string,
+          init?: { body?: string; method?: string },
+        ) => {
+          const method = init?.method ?? "GET";
           calls.push({
             url: String(url),
+            method,
             body: init?.body ? JSON.parse(init.body) : undefined,
           });
+          if (method === "GET" && !sessionsExist) {
+            return new Response("not found", { status: 404 });
+          }
           return new Response(JSON.stringify({ thread_key: "t", created: true }), {
             headers: { "content-type": "application/json" },
             status: 200,
@@ -975,10 +985,10 @@ describe("pull request closed", () => {
     } as unknown as PrManagerContext;
   }
 
-  async function runClose(merged: boolean) {
-    const calls: { url: string; body: unknown }[] = [];
+  async function runClose(merged: boolean, sessionsExist = true) {
+    const calls: CloseCall[] = [];
     await handlePullRequestEvent(
-      closeCtx(calls),
+      closeCtx(calls, sessionsExist),
       JSON.stringify({
         action: "closed",
         pull_request: { merged, number: 41, title: "Add the thing" },
@@ -988,7 +998,7 @@ describe("pull request closed", () => {
     return calls;
   }
 
-  function appendedTexts(calls: { url: string; body: unknown }[]): string[] {
+  function appendedTexts(calls: CloseCall[]): string[] {
     return calls
       .filter((call) => call.url.endsWith("/messages"))
       .flatMap((call) => {
@@ -1013,6 +1023,13 @@ describe("pull request closed", () => {
   test("starts no execution, so a close consumes no sandbox slot", async () => {
     const calls = await runClose(false);
     expect(calls.some((call) => call.url.includes("/execute"))).toBe(false);
+  });
+
+  test("does not create sessions for an unrelated closed pull request", async () => {
+    const calls = await runClose(false, false);
+    expect(calls.filter((call) => call.method === "GET")).toHaveLength(2);
+    expect(calls.some((call) => call.url.endsWith("/messages"))).toBe(false);
+    expect(calls.some((call) => call.method === "POST")).toBe(false);
   });
 
   test("names the outcome, because superseded and finished differ", async () => {

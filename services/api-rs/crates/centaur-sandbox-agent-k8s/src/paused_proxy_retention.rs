@@ -188,16 +188,9 @@ impl PausedProxyRetentionSweep {
             .iter()
             .map(|budget| budget.name.as_str())
             .collect();
-        let (load, candidates) = self.observe_cluster_pods(&steering).await?;
+        let (total_load, candidates) = self.observe_cluster_pods(&steering).await?;
         let retained = self.paused_proxy_candidates(&candidates).await?;
-
-        for budget in &mut node_budgets {
-            budget.load_pods = load.get(&budget.name).copied().unwrap_or_default();
-            budget.retained_pods = retained
-                .iter()
-                .filter(|entry| entry.node == budget.name)
-                .count();
-        }
+        apply_node_pod_census(&mut node_budgets, &total_load, &retained);
 
         let victims = select_evictions(
             &node_budgets,
@@ -292,9 +285,10 @@ impl PausedProxyRetentionSweep {
             .collect())
     }
 
-    /// A cluster-wide pod census over the steering nodes: per-node load
-    /// (everything except evictable paused proxies) and the candidate proxy
-    /// pods, keyed by sandbox id with their node.
+    /// A cluster-wide pod census over the steering nodes: total per-node load
+    /// and candidate proxy pods, keyed by sandbox id with their node. The
+    /// caller subtracts only the candidates proven to belong to paused
+    /// sandboxes; running and ambiguous proxies must continue to consume load.
     async fn observe_cluster_pods(
         &self,
         steering: &BTreeSet<&str>,
@@ -313,6 +307,7 @@ impl PausedProxyRetentionSweep {
             if !steering.contains(node_name.as_str()) || pod.metadata.deletion_timestamp.is_some() {
                 continue;
             }
+            *load.entry(node_name.clone()).or_default() += 1;
             let labels = pod.metadata.labels.as_ref();
             let sandbox_id = if labels.is_some_and(|labels| labels.contains_key(IRON_PROXY_LABEL)) {
                 labels
@@ -321,13 +316,8 @@ impl PausedProxyRetentionSweep {
             } else {
                 None
             };
-            match sandbox_id {
-                // A proxy pod we cannot attribute to a sandbox still counts
-                // as load: it holds a slot the node budget has to cover.
-                Some(sandbox_id) => {
-                    candidates.entry(sandbox_id).or_insert_with(|| node_name);
-                }
-                None => *load.entry(node_name).or_default() += 1,
+            if let Some(sandbox_id) = sandbox_id {
+                candidates.entry(sandbox_id).or_insert(node_name);
             }
         }
         Ok((load, candidates))
@@ -403,6 +393,29 @@ impl PausedProxyRetentionSweep {
                 .await;
         }
         self.backend.delete_iron_proxy_resources(&id).await
+    }
+}
+
+/// Convert the total pod census into non-evictable load plus retained paused
+/// proxies. Every pod starts in `total_load`; only proxies proven paused and
+/// therefore eligible for this sweep are removed from that load. In
+/// particular, running proxies and proxies with missing or unreadable Sandbox
+/// records still occupy a node slot and must constrain retention.
+fn apply_node_pod_census(
+    budgets: &mut [NodePodBudget],
+    total_load: &BTreeMap<String, usize>,
+    retained: &[RetainedPausedProxy],
+) {
+    for budget in budgets {
+        budget.retained_pods = retained
+            .iter()
+            .filter(|entry| entry.node == budget.name)
+            .count();
+        budget.load_pods = total_load
+            .get(&budget.name)
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(budget.retained_pods);
     }
 }
 
@@ -614,5 +627,21 @@ mod tests {
             ..default
         };
         assert!(!disabled.is_enabled());
+    }
+
+    #[test]
+    fn running_and_ambiguous_proxies_remain_in_node_load() {
+        let mut budgets = [node("node-a", 20, 0)];
+        let total_load = BTreeMap::from([("node-a".to_owned(), 10)]);
+        // The census saw ten pods, including several proxy candidates. Only
+        // this one was proven to be paused; every running or ambiguous proxy
+        // remains part of load rather than silently expanding headroom.
+        let retained = paused_on("node-a", 1);
+
+        apply_node_pod_census(&mut budgets, &total_load, &retained);
+
+        assert_eq!(budgets[0].retained_pods, 1);
+        assert_eq!(budgets[0].load_pods, 9);
+        assert!(select_evictions(&budgets, &retained, 2, None).is_empty());
     }
 }

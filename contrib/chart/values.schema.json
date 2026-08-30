@@ -10,9 +10,9 @@
         "allowedHosts": {
           "type": "array",
           "items": { "type": "string" },
-        "entitlementsHosts": { "type": "array", "items": { "type": "string" } },
           "uniqueItems": true
         },
+        "entitlementsHosts": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "sentryDsn": { "type": "string" },
         "railsEnv": { "type": "string" },
         "image": {

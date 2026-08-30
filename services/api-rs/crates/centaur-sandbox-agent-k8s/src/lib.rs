@@ -322,11 +322,7 @@ impl AgentSandboxBackend {
         };
         // A merge patch on `containers` would replace the whole array, so this
         // has to be a JSON patch at the container's own index.
-        let patch = json!([{
-            "op": "replace",
-            "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
-            "value": desired_value,
-        }]);
+        let patch = resources_json_patch(index, desired_value);
         self.sandboxes()
             .patch(
                 id.as_str(),
@@ -1349,6 +1345,17 @@ fn resources_drift(
     (current != desired_value).then_some((index, desired_value))
 }
 
+/// JSON Patch `add` both creates an absent object member and replaces an
+/// existing one. `replace` cannot fill a container whose serialized template
+/// omitted `resources`, which is exactly one of the drift cases above.
+fn resources_json_patch(index: usize, desired_value: Value) -> Value {
+    json!([{
+        "op": "add",
+        "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
+        "value": desired_value,
+    }])
+}
+
 fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     let resources = spec.resources.as_ref()?;
     (!resources.is_empty()).then(|| json!(resources))
@@ -2189,5 +2196,15 @@ mod tests {
             resources_drift(&containers, "agent", &desired_memory("32Gi")).expect("drift");
         assert_eq!(index, 0);
         assert_eq!(value["limits"]["memory"], "32Gi");
+    }
+
+    #[test]
+    fn resources_patch_adds_an_absent_resources_member() {
+        let patch = resources_json_patch(2, json!({ "limits": { "memory": "32Gi" } }));
+        assert_eq!(patch[0]["op"], "add");
+        assert_eq!(
+            patch[0]["path"],
+            "/spec/podTemplate/spec/containers/2/resources"
+        );
     }
 }
