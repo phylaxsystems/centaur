@@ -181,6 +181,16 @@ struct ActivitySummaryArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     max_output_tokens: u64,
+    /// Reasoning effort for the summary call. Empty omits the parameter, for a
+    /// server that rejects it. Left unset, a server that resolves an absent
+    /// effort to its highest level burns the whole output budget reasoning and
+    /// returns no message.
+    #[arg(
+        long = "session-activity-summary-reasoning-effort",
+        env = "SESSION_ACTIVITY_SUMMARY_REASONING_EFFORT",
+        default_value = "low"
+    )]
+    reasoning_effort: String,
 }
 
 impl ActivitySummaryArgs {
@@ -205,6 +215,7 @@ impl ActivitySummaryArgs {
             max_output_tokens: u16::try_from(self.max_output_tokens).unwrap_or(u16::MAX),
             min_interval: Duration::from_secs(self.min_interval_secs),
             model: self.model.clone(),
+            reasoning_effort: clean_optional_value(Some(self.reasoning_effort.as_str())),
             timeout: Duration::from_secs(self.timeout_secs),
         })
     }

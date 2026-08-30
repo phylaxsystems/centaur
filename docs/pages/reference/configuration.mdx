@@ -129,6 +129,8 @@ Sandbox lifecycle:
 | `SESSION_MAX_DURATION_MS` | `slackbotv2.extraEnv`. | Optional per-execution max duration forwarded to api-rs. api-rs rejects requests where `idle_timeout_ms` is greater than `max_duration_ms`. |
 | `apiRs.sandboxMaxLifetimeSecs` / `SESSION_SANDBOX_MAX_LIFETIME_SECS` | Helm value, default `259200` (72 hours). | Restart-surviving sandbox deletion backstop. The reaper stops any non-terminal sandbox older than this, regardless of whether it is running or suspended. Set `0` to disable max-lifetime reaping. |
 | `apiRs.sandboxReapIntervalSecs` / `SESSION_SANDBOX_REAP_INTERVAL_SECS` | Helm value, default `300`. | How often api-rs sweeps observed sandboxes for max-lifetime expiry. |
+| `apiRs.activitySummary.reasoningEffort` / `SESSION_ACTIVITY_SUMMARY_REASONING_EFFORT` | Helm value, default `low`. | Reasoning effort sent with the activity-summary call. The output budget is small, so a server that resolves an absent effort to its highest level spends the whole budget reasoning and returns an `incomplete` response with no message. Set empty to omit the parameter for a server that rejects it. |
+| `SESSION_TITLE_REASONING_EFFORT` | Env on api-rs, default `low`. | The same, for the session-title call, whose budget is 24 output tokens. Set empty to omit the parameter. |
 
 There is no separate suspended-only delete timer. Pausing is controlled by the
 per-execution idle timeout; deletion is controlled by sandbox max lifetime.
