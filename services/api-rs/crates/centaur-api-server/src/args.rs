@@ -635,6 +635,17 @@ struct SandboxArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     sandbox_reap_interval_secs: u64,
+    /// Delete session_events older than this many days. 0 disables retention,
+    /// which is the default: session_events is durable history, and dropping it
+    /// is not something to start doing to an existing deployment unasked.
+    /// Events of a queued or running execution are never deleted, whatever
+    /// their age.
+    #[arg(
+        long = "session-events-retention-days",
+        env = "SESSION_EVENTS_RETENTION_DAYS",
+        default_value_t = 0
+    )]
+    session_events_retention_days: u64,
     #[arg(
         long = "session-sandbox-cleanup-interval-secs",
         env = "SESSION_SANDBOX_CLEANUP_INTERVAL_SECS",
@@ -1404,6 +1415,8 @@ impl SandboxArgs {
         SessionSandboxCleanupConfig {
             interval: duration(self.sandbox_cleanup_interval_secs),
             idle_backstop: duration(self.sandbox_idle_cleanup_backstop_secs),
+            event_retention: (self.session_events_retention_days > 0)
+                .then(|| Duration::from_secs(self.session_events_retention_days * 24 * 60 * 60)),
         }
     }
 }

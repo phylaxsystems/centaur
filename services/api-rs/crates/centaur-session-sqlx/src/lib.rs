@@ -1220,6 +1220,50 @@ impl PgSessionStore {
             .collect()
     }
 
+    /// Deletes one batch of `session_events` older than `cutoff`, returning how
+    /// many rows went. Returns fewer than `batch_limit` when the backlog is
+    /// drained.
+    ///
+    /// Batched rather than a single statement because this table is the largest
+    /// in the schema — a deployment can accumulate millions of rows before
+    /// retention is first switched on, and one unbounded delete would hold locks
+    /// and bloat the table for the duration.
+    ///
+    /// Events belonging to a `queued` or `running` execution are never deleted,
+    /// whatever their age. A long-running turn's early output is still needed to
+    /// replay it, and age alone does not distinguish "old" from "still in use".
+    pub async fn delete_events_older_than(
+        &self,
+        cutoff: std::time::SystemTime,
+        batch_limit: i64,
+    ) -> Result<u64, SessionStoreError> {
+        let cutoff = OffsetDateTime::from(cutoff);
+        let result = sqlx::query(
+            r#"
+            with doomed as (
+                select e.event_id
+                from session_events e
+                left join session_executions x on x.execution_id = e.execution_id
+                where e.created_at < $1
+                  and (
+                      e.execution_id is null
+                      or x.status is null
+                      or x.status not in ('queued', 'running')
+                  )
+                order by e.event_id
+                limit $2
+            )
+            delete from session_events
+            where event_id in (select event_id from doomed)
+            "#,
+        )
+        .bind(cutoff)
+        .bind(batch_limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn list_sandbox_capacity_candidates(
         &self,
         excluded_thread_key: Option<&ThreadKey>,

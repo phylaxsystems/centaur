@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, SystemTime},
+};
 
 use centaur_sandbox_core::{ObservedSandbox, SandboxError, SandboxId, SandboxStatus};
 use tokio::time::{MissedTickBehavior, interval};
@@ -7,6 +10,11 @@ use tracing::{info, warn};
 use crate::{RuntimeContext, SessionRuntimeError, record_idle_pause};
 
 const COMPONENT_LABEL: &str = "centaur.ai/component";
+/// Rows per delete statement, and the most statements one sweep will issue.
+/// Together they bound a sweep at 100k rows, which drains a large backlog over
+/// successive sweeps rather than in one long-running transaction.
+const EVENT_RETENTION_BATCH_ROWS: i64 = 5_000;
+const EVENT_RETENTION_MAX_BATCHES: usize = 20;
 const WORKFLOW_RUN_COMPONENT: &str = "workflow-run";
 
 #[derive(Clone, Copy, Debug)]
@@ -16,6 +24,10 @@ pub struct SessionSandboxCleanupConfig {
     /// Pause session sandboxes whose latest execution has been terminal longer
     /// than this. `None` disables the idle backstop arm.
     pub idle_backstop: Option<Duration>,
+    /// Delete `session_events` older than this. `None` disables retention,
+    /// which is the default: dropping durable history is not something to start
+    /// doing to an existing deployment without it being asked for.
+    pub event_retention: Option<Duration>,
 }
 
 impl SessionSandboxCleanupConfig {
@@ -30,6 +42,7 @@ pub struct SessionSandboxCleanupReport {
     pub failed_orphans: usize,
     pub idle_pause_attempts: usize,
     pub failed_idle_pauses: usize,
+    pub deleted_events: u64,
 }
 
 pub struct SessionSandboxCleanupWorker {
@@ -69,7 +82,53 @@ impl SessionSandboxCleanupWorker {
         let mut report = SessionSandboxCleanupReport::default();
         self.reap_unreferenced_sandboxes(&mut report).await?;
         self.pause_idle_sandboxes(&mut report).await?;
+        self.expire_session_events(&mut report).await?;
         Ok(report)
+    }
+
+    /// Delete session events past the retention window.
+    ///
+    /// `session_events` carries one row per harness stdout line and nothing
+    /// ever removed them, so the table grew monotonically for the life of the
+    /// deployment -- roughly 450MB a day on a modest single node, against a
+    /// default 20Gi control-plane volume.
+    ///
+    /// Bounded per sweep rather than draining the backlog in one pass. When
+    /// retention is first switched on there may be millions of rows to clear,
+    /// and a sweep that ran until done would hold the cleanup worker (and its
+    /// share of the connection pool) for as long as that took. Successive
+    /// sweeps drain it instead.
+    async fn expire_session_events(
+        &self,
+        report: &mut SessionSandboxCleanupReport,
+    ) -> Result<(), SessionRuntimeError> {
+        let Some(retention) = self.config.event_retention else {
+            return Ok(());
+        };
+        let Some(cutoff) = SystemTime::now().checked_sub(retention) else {
+            return Ok(());
+        };
+        for _ in 0..EVENT_RETENTION_MAX_BATCHES {
+            let deleted = self
+                .ctx
+                .store
+                .delete_events_older_than(cutoff, EVENT_RETENTION_BATCH_ROWS)
+                .await?;
+            report.deleted_events += deleted;
+            if deleted < EVENT_RETENTION_BATCH_ROWS as u64 {
+                break;
+            }
+        }
+        if report.deleted_events > 0 {
+            info!(
+                component = crate::COMPONENT_SESSION_RUNTIME,
+                event = "session_events_expired",
+                deleted = report.deleted_events,
+                retention_secs = retention.as_secs(),
+                "deleted session events past the retention window"
+            );
+        }
+        Ok(())
     }
 
     async fn reap_unreferenced_sandboxes(
@@ -287,5 +346,33 @@ mod tests {
             select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending).is_empty()
         );
         assert!(pending.is_empty());
+    }
+
+    fn cleanup_config(retention: Option<Duration>) -> SessionSandboxCleanupConfig {
+        SessionSandboxCleanupConfig {
+            interval: Some(Duration::from_secs(300)),
+            idle_backstop: None,
+            event_retention: retention,
+        }
+    }
+
+    #[test]
+    fn retention_is_off_by_default_and_does_not_disable_the_worker() {
+        // Dropping durable history unasked would be the wrong default, but the
+        // worker still has to run for the sandbox arms.
+        let config = cleanup_config(None);
+        assert!(config.event_retention.is_none());
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn a_sweep_is_bounded_so_a_large_backlog_drains_over_several() {
+        // The first sweep after enabling retention may face millions of rows.
+        // Bounding it keeps the worker and its connections from being held for
+        // the whole drain.
+        assert_eq!(
+            EVENT_RETENTION_BATCH_ROWS * EVENT_RETENTION_MAX_BATCHES as i64,
+            100_000
+        );
     }
 }

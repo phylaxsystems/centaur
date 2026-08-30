@@ -530,6 +530,14 @@ apiRs:
   # consecutive sweeps and restore idle-pauses lost across api-rs restarts.
   # The idle backstop is only used when older execution rows have no persisted
   # idle_timeout_ms. 0 disables the corresponding arm.
+  # Delete session_events older than this many days. 0 disables retention.
+  # session_events carries one row per harness stdout line and nothing removed
+  # them, so the table grows for the life of the deployment -- order 450MB/day
+  # on a modest single node, against the 20Gi default Postgres volume below.
+  # Events of a queued or running execution are never deleted, whatever their
+  # age. Sweeps run on sandboxCleanupIntervalSecs and are bounded per pass, so
+  # a large first backlog drains over several sweeps.
+  sessionEventsRetentionDays: 0
   sandboxCleanupIntervalSecs: 300
   sandboxIdleCleanupBackstopSecs: 21600 # 6 hours
   activitySummary:
