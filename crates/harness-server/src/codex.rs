@@ -608,7 +608,7 @@ impl CodexJsonRpcChild {
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
-            if notification_method(&value).is_some() {
+            if notification_method(&value).is_some_and(should_forward_notification) {
                 write_value(stdout, &value)?;
             }
         }
@@ -910,6 +910,22 @@ fn notification_method(value: &Value) -> Option<&str> {
         return None;
     }
     value.get("method").and_then(Value::as_str)
+}
+
+/// Codex app-server notifications that reach no consumer and so should not be
+/// forwarded onto the blocks stream.
+///
+/// Forwarding is otherwise verbatim, because the wire contract clients parse
+/// (see `packages/harness-events`) is the codex notification shape. That makes
+/// this a deny list rather than an allow list: dropping an unrecognised method
+/// would silently break a client that does understand it.
+///
+/// `account/rateLimits/updated` is the case that earns the list. Nothing in
+/// this crate or in `packages/harness-events` names it, every field arrives
+/// null, and it repeats across every pod, so its only effect is volume on a
+/// stream that is also the sandbox's container log.
+fn should_forward_notification(method: &str) -> bool {
+    method != "account/rateLimits/updated"
 }
 
 fn error_notification_will_retry(value: &Value) -> bool {
@@ -1214,5 +1230,29 @@ mod tests {
         });
         assert!(!is_terminal_notification(&retryable, "thread-1", "turn-1"));
         assert!(is_terminal_notification(&exhausted, "thread-1", "turn-1"));
+    }
+
+    #[test]
+    fn rate_limit_notifications_are_not_forwarded() {
+        assert!(!should_forward_notification("account/rateLimits/updated"));
+    }
+
+    /// The wire contract clients parse is the codex notification shape, so the
+    /// filter is a deny list: anything it does not name keeps flowing, including
+    /// methods this build has never seen.
+    #[test]
+    fn other_notifications_still_forward() {
+        for method in [
+            "item/reasoning/textDelta",
+            "item/reasoning/summaryTextDelta",
+            "turn/completed",
+            "remoteControl/status/changed",
+            "some/method/added/after/this/build",
+        ] {
+            assert!(
+                should_forward_notification(method),
+                "{method} should still forward"
+            );
+        }
     }
 }
