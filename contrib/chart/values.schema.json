@@ -10,6 +10,7 @@
         "allowedHosts": {
           "type": "array",
           "items": { "type": "string" },
+        "entitlementsHosts": { "type": "array", "items": { "type": "string" } },
           "uniqueItems": true
         },
         "sentryDsn": { "type": "string" },
