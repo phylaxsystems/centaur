@@ -245,6 +245,19 @@ impl AgentSandboxBackend {
         }
     }
 
+    /// Delete leaked iron-proxy resources on a failure path, surfacing the
+    /// result instead of discarding it. The primary error is what the caller
+    /// returns; a failed unwind is a leak the operator must see.
+    async fn unwind_iron_proxy_resources(&self, id: &SandboxId) {
+        if let Err(error) = self.delete_iron_proxy_resources(id).await {
+            tracing::warn!(
+                sandbox_id = id.as_str(),
+                %error,
+                "failed to unwind leaked iron-proxy resources"
+            );
+        }
+    }
+
     async fn get_pod(&self, id: &SandboxId) -> SandboxResult<Option<Pod>> {
         match self.pods().get(id.as_str()).await {
             Ok(pod) => Ok(Some(pod)),
@@ -456,18 +469,18 @@ impl SandboxBackend for AgentSandboxBackend {
             .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
             .await
         {
-            let _ = self.delete_iron_proxy_resources(&id).await;
+            self.unwind_iron_proxy_resources(&id).await;
             return Err(err);
         }
         if let Err(error) = self.create_sandbox_files_config_map(&id, &spec).await {
-            let _ = self.delete_iron_proxy_resources(&id).await;
+            self.unwind_iron_proxy_resources(&id).await;
             return Err(error);
         }
         let sandbox = match build_agent_sandbox(&id, &spec, &self.config) {
             Ok(sandbox) => sandbox,
             Err(error) => {
                 let _ = self.delete_sandbox_files_config_map(&id).await;
-                let _ = self.delete_iron_proxy_resources(&id).await;
+                self.unwind_iron_proxy_resources(&id).await;
                 return Err(error);
             }
         };
@@ -479,7 +492,7 @@ impl SandboxBackend for AgentSandboxBackend {
             Ok(created) => created,
             Err(err) => {
                 let _ = self.delete_sandbox_files_config_map(&id).await;
-                let _ = self.delete_iron_proxy_resources(&id).await;
+                self.unwind_iron_proxy_resources(&id).await;
                 return Err(map_kube_error("create sandbox", err));
             }
         };
@@ -609,6 +622,10 @@ impl SandboxBackend for AgentSandboxBackend {
             .await
     }
 
+    async fn reap_orphan_iron_proxy_resources(&self) -> SandboxResult<BTreeMap<String, u32>> {
+        self.sweep_orphan_iron_proxy_resources().await
+    }
+
     async fn ensure_iron_control_proxy_resources(
         &self,
         id: &SandboxId,
@@ -641,20 +658,26 @@ impl SandboxBackend for AgentSandboxBackend {
             .create_iron_proxy_resources(id, resolved_iron_proxy.as_ref())
             .await
         {
-            let _ = self.delete_iron_proxy_resources(id).await;
+            self.unwind_iron_proxy_resources(id).await;
             return Err(err);
         }
         // The proxy resources were recreated, so re-bind them to the sandbox
         // for cascade deletion.
         let sandbox = self.get_sandbox(id).await?;
-        if let Some(sandbox) = &sandbox
-            && let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await
-        {
-            tracing::warn!(
+        match &sandbox {
+            Some(sandbox) => {
+                if let Err(error) = self.adopt_iron_proxy_resources(id, sandbox).await {
+                    tracing::warn!(
+                        sandbox_id = id.as_str(),
+                        %error,
+                        "failed to set ownerReferences on resumed iron-proxy resources"
+                    );
+                }
+            }
+            None => tracing::warn!(
                 sandbox_id = id.as_str(),
-                %error,
-                "failed to set ownerReferences on resumed iron-proxy resources"
-            );
+                "sandbox CR missing during resume; recreated iron-proxy resources are unowned"
+            ),
         }
         // A pod that was deleted out from under a `Suspended`/`Created`
         // sandbox (janitor, node pressure, manual reap) comes back through
