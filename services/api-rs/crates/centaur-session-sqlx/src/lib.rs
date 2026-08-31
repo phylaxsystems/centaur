@@ -2212,19 +2212,23 @@ async fn record_execution_metric<'a>(
 
     let mut started = None;
     for row in event_rows {
-        let Some(event) = parse_command_metric_event(&row.payload, false) else {
-            continue;
-        };
-        if event.item_id != completed.item_id {
+        // Check completions independently from starts.  Parsing every row as
+        // a start would discard prior completions before the idempotency check.
+        if let Some(event) = parse_command_metric_event(&row.payload, true) {
+            if event.item_id == completed.item_id {
+                // At-least-once stdout delivery must not inflate a bucket when
+                // the same normalized completion is observed more than once.
+                return Ok(());
+            }
             continue;
         }
-        if event.completed {
-            // At-least-once stdout delivery must not inflate a bucket when the
-            // same normalized completion is observed more than once.
-            return Ok(());
+        if started.is_none()
+            && let Some(event) = parse_command_metric_event(&row.payload, false)
+            && event.item_id == completed.item_id
+        {
+            started = Some(event);
+            break;
         }
-        started = Some(event);
-        break;
     }
     let Some(started) = started else {
         return Ok(());
@@ -2420,12 +2424,15 @@ mod tests {
     use centaur_session_core::{HarnessType, ThreadKey};
     use serde_json::{Value, json};
     use time::{Duration as TimeDuration, OffsetDateTime};
+    use tokio::sync::OnceCell;
     use uuid::Uuid;
 
     use super::{
         IdleSandboxCandidateRow, PgSessionStore, SESSION_OUTPUT_LINE_EVENT,
         SessionEventNotification, command_family, parse_command_metric_event, safe_dimension,
     };
+
+    static TEST_MIGRATIONS: OnceCell<()> = OnceCell::const_new();
 
     async fn test_store() -> Option<PgSessionStore> {
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
@@ -2435,7 +2442,11 @@ mod tests {
         let store = PgSessionStore::connect(&url)
             .await
             .expect("connect test db");
-        store.run_migrations().await.expect("run migrations");
+        TEST_MIGRATIONS
+            .get_or_init(|| async {
+                store.run_migrations().await.expect("run migrations");
+            })
+            .await;
         Some(store)
     }
 
@@ -3149,6 +3160,11 @@ mod tests {
             .expect("inspect aggregate schema"),
             0
         );
+        store
+            .complete_execution_if_active_and_stdout_owner(&execution_id, "metrics-owner")
+            .await
+            .expect("complete metrics execution")
+            .expect("metrics owner completes execution");
 
         let unknown_execution = store
             .create_execution(&thread_key, None, json!({}))
@@ -3195,6 +3211,11 @@ mod tests {
             .expect("count aggregate metrics"),
             1
         );
+        store
+            .complete_execution_if_active_and_stdout_owner(&unknown_execution, "metrics-owner")
+            .await
+            .expect("complete unknown execution")
+            .expect("metrics owner completes unknown execution");
 
         unsafe { std::env::remove_var(super::EXECUTION_METRICS_SCOPE_ENV) };
         let no_scope_execution = store
@@ -3245,6 +3266,11 @@ mod tests {
             .expect("count no-scope aggregate metrics"),
             1
         );
+        store
+            .complete_execution_if_active_and_stdout_owner(&no_scope_execution, "metrics-owner")
+            .await
+            .expect("complete no-scope execution")
+            .expect("metrics owner completes no-scope execution");
 
         unsafe { std::env::set_var(super::EXECUTION_METRICS_SCOPE_ENV, &scope) };
         let no_persona_thread = ThreadKey::parse(format!(
