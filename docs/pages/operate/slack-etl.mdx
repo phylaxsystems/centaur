@@ -110,7 +110,7 @@ apiRs:
 | `SLACK_SYNC_INDEX_PRIVATE_CHANNELS` | `false` | Includes private channels visible to the ETL token in Slack sync and backfill. |
 | `SLACK_ETL_ATTACHMENTS_ENABLED` | `true` | Download Slack message attachment bytes into Postgres. Metadata rows are still written when downloads are disabled. |
 | `SLACK_ETL_ATTACHMENT_MAX_BYTES` | `10485760` | Per-file byte cap for Slack attachment downloads. Oversized files keep metadata with `skipped_too_large` status. |
-| `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` | empty | Comma-separated channel-name globs to skip, without needing the leading `#`. |
+| `SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS` | empty | Comma-separated channel-name globs or exact channel IDs to skip, without needing the leading `#`. Prefer an exact ID when a rename must not bypass the exclusion. |
 | `SLACK_RETENTION_ENABLED` | `true` | Allows the `slack_retention` schedule to run when at least one Slack retention TTL is positive. |
 | `SLACK_RETENTION_INTERVAL_MINUTES` | `60` | How often to prune Slack retention-managed rows. |
 | `SLACK_ETL_RETENTION_DAYS` | `0` | Deletes Slack ETL messages, derived Slack documents, and terminal ETL run/job rows older than this many days. `0` disables ETL retention. |

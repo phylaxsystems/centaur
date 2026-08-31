@@ -68,7 +68,7 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
 
 
 def _channel_exclusion_patterns(value: str | None) -> list[str]:
-    """Parse comma-separated Slack channel exclusion globs."""
+    """Parse comma-separated Slack channel name/ID exclusion globs."""
     if not value:
         return []
     patterns = []
@@ -84,15 +84,24 @@ def _channel_name(channel: dict[str, Any]) -> str:
     return str(channel.get("name") or "").strip().lower().lstrip("#")
 
 
+def _channel_id(channel: dict[str, Any]) -> str:
+    """Return the normalized Slack channel ID used for config matching."""
+    return str(channel.get("id") or "").strip().lower()
+
+
 def _channel_exclusion_reason(
     channel: dict[str, Any], patterns: list[str]
 ) -> str | None:
     """Return the configured pattern excluding a channel, if any."""
-    name = _channel_name(channel)
-    if not name:
+    identifiers = tuple(
+        identifier
+        for identifier in (_channel_name(channel), _channel_id(channel))
+        if identifier
+    )
+    if not identifiers:
         return None
     for pattern in patterns:
-        if fnmatch.fnmatchcase(name, pattern):
+        if any(fnmatch.fnmatchcase(identifier, pattern) for identifier in identifiers):
             return f"excluded_by_config:{pattern}"
     return None
 
@@ -145,14 +154,14 @@ async def _purge_excluded_channel_data(
             str(row["channel_id"])
             for row in public_rows
             if _channel_exclusion_reason(
-                {"name": row["channel_name"]}, patterns
+                {"id": row["channel_id"], "name": row["channel_name"]}, patterns
             )
         )
         private_channel_keys = {
             (str(row["home_team_id"]), str(row["conversation_id"]))
             for row in private_rows
             if _channel_exclusion_reason(
-                {"name": row["channel_name"]}, patterns
+                {"id": row["conversation_id"], "name": row["channel_name"]}, patterns
             )
         }
         all_channel_ids = sorted(

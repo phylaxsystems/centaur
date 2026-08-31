@@ -244,6 +244,27 @@ class FakePurgePool:
         return self.connection
 
 
+def test_channel_exclusion_accepts_exact_channel_id_after_rename():
+    sync = _load_sync()
+
+    included, excluded = sync._filter_excluded_channels(
+        [
+            {"id": "C_EXCLUDED", "name": "renamed-room"},
+            {"id": "C_INCLUDED", "name": "general"},
+        ],
+        sync._channel_exclusion_patterns("c_excluded"),
+    )
+
+    assert [channel["id"] for channel in included] == ["C_INCLUDED"]
+    assert excluded == [
+        {
+            "channel_id": "C_EXCLUDED",
+            "channel_name": "renamed-room",
+            "reason": "excluded_by_config:c_excluded",
+        }
+    ]
+
+
 def test_purge_excluded_channel_data_removes_public_private_and_derived_rows():
     sync = _load_sync()
     pool = FakePurgePool()

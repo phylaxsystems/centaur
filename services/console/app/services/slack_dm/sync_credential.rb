@@ -221,20 +221,24 @@ module SlackDm
     def excluded_private_channel?(conversation)
       return false unless conversation["is_private"] == true
 
-      name = normalized_channel_name(conversation["name"])
-      return false if name.empty?
+      identifiers = [ conversation["name"], conversation["id"] ]
+        .map { |value| normalized_channel_identifier(value) }
+        .reject(&:empty?)
+      return false if identifiers.empty?
 
-      excluded_channel_patterns.any? { |pattern| File.fnmatch?(pattern, name) }
+      excluded_channel_patterns.any? do |pattern|
+        identifiers.any? { |identifier| File.fnmatch?(pattern, identifier) }
+      end
     end
 
     def excluded_channel_patterns
       ConsoleEnv[EXCLUDED_CHANNEL_PATTERNS_ENV].to_s.split(",").filter_map do |pattern|
-        normalized = normalized_channel_name(pattern)
+        normalized = normalized_channel_identifier(pattern)
         normalized unless normalized.empty?
       end
     end
 
-    def normalized_channel_name(value)
+    def normalized_channel_identifier(value)
       value.to_s.strip.downcase.delete_prefix("#")
     end
 

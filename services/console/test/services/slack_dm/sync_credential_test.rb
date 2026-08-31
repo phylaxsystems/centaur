@@ -322,7 +322,7 @@ module SlackDm
     test "sync excludes configured private channels before membership and history reads" do
       env_key = "CENTAUR_CONSOLE_SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS"
       previous = ENV[env_key]
-      ENV[env_key] = "#sensitive-*, exact-room"
+      ENV[env_key] = "#sensitive-*, exact-room, g_excluded_id"
       api_client = FakeApiClient.new
       membership_calls = []
       history_calls = []
@@ -335,7 +335,8 @@ module SlackDm
           {
             "ok" => true,
             "channels" => [
-              { "id" => "G_EXCLUDED", "name" => "Sensitive-Roadmap", "is_private" => true },
+              { "id" => "G_EXCLUDED_NAME", "name" => "Sensitive-Roadmap", "is_private" => true },
+              { "id" => "G_EXCLUDED_ID", "name" => "renamed-room", "is_private" => true },
               { "id" => "G_INCLUDED", "name" => "strategy", "is_private" => true }
             ],
             "response_metadata" => { "next_cursor" => "" }
