@@ -12,6 +12,7 @@ module SlackDm
     CONVERSATIONS_MEMBERS_ENDPOINT = "https://slack.com/api/conversations.members"
     CONVERSATIONS_HISTORY_ENDPOINT = "https://slack.com/api/conversations.history"
     CONVERSATIONS_REPLIES_ENDPOINT = "https://slack.com/api/conversations.replies"
+    EXCLUDED_CHANNEL_PATTERNS_ENV = "SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS"
     API_READ_TIMEOUT_SECONDS = 120
     INLINE_RATE_LIMIT_WAIT_THRESHOLD_SECONDS = 5.minutes.to_i
     MAX_INLINE_RATE_LIMIT_RETRIES = 5
@@ -209,11 +210,32 @@ module SlackDm
       types = self.class.supported_conversation_types(@credential.scopes)
       raise SlackApi::Error, "Slack credential has no supported conversation scopes" if types.empty?
 
-      each_page(
+      conversations = each_page(
         CONVERSATIONS_LIST_ENDPOINT,
         { "types" => types.join(","), "exclude_archived" => "false", "limit" => list_page_size },
         max_pages: list_max_pages
       ).flat_map { |page| Array(page["channels"]) }
+      conversations.reject { |conversation| excluded_private_channel?(conversation) }
+    end
+
+    def excluded_private_channel?(conversation)
+      return false unless conversation["is_private"] == true
+
+      name = normalized_channel_name(conversation["name"])
+      return false if name.empty?
+
+      excluded_channel_patterns.any? { |pattern| File.fnmatch?(pattern, name) }
+    end
+
+    def excluded_channel_patterns
+      ConsoleEnv[EXCLUDED_CHANNEL_PATTERNS_ENV].to_s.split(",").filter_map do |pattern|
+        normalized = normalized_channel_name(pattern)
+        normalized unless normalized.empty?
+      end
+    end
+
+    def normalized_channel_name(value)
+      value.to_s.strip.downcase.delete_prefix("#")
     end
 
     def normalize_conversation(conversation, home_team_id, batch)

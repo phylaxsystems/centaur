@@ -249,6 +249,8 @@ spec:
             - name: CENTAUR_CONSOLE_SLACK_DM_SYNC_OAUTH_APP_SLUG
               value: {{ . | quote }}
 {{- end }}
+            - name: CENTAUR_CONSOLE_SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS
+              value: {{ dig "slack" "excludedChannelPatterns" "" (.Values.apiRs.etl | default dict) | quote }}
             - name: CENTAUR_CONSOLE_GOOGLE_DOCS_SYNC_ENABLED
               value: {{ $console.googleDocsSync.enabled | quote }}
             - name: PORT

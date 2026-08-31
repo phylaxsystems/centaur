@@ -218,6 +218,13 @@ async fn assert_channel_visibility(conn: &mut PgConnection) -> Result<(), Box<dy
     let unset_channel = visible_rows(conn, "centaur_slack_reader", None).await?;
     assert_eq!(unset_channel, empty_visible_rows());
 
+    let excluded_channel = visible_rows(conn, "centaur_slack_reader", Some("C_EXCLUDED")).await?;
+    assert_eq!(
+        excluded_channel,
+        empty_visible_rows(),
+        "an unsyncable channel must fail closed even for its channel principal"
+    );
+
     let formerly_admin_channel =
         visible_rows(conn, "centaur_slack_reader", Some("C_ADMIN")).await?;
     assert_eq!(
@@ -1065,6 +1072,19 @@ async fn assert_company_context_reader_channel_grants(
         },
         "channel-only grants must expose exactly the granted channels without user-scoped data"
     );
+
+    let excluded_channel_grants = company_context_reader_rows(
+        conn,
+        CompanyContextReaderSettings {
+            slack_channel_id: Some("C_EXCLUDED"),
+            slack_history_channel_ids: Some(r#"["C_EXCLUDED"]"#),
+            slack_include_public: Some(false),
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert!(excluded_channel_grants.slack_channels.is_empty());
+    assert!(excluded_channel_grants.company_context_docs.is_empty());
     Ok(())
 }
 
@@ -1134,14 +1154,17 @@ async fn assert_company_context_reader_public_channel_membership(
 async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         r#"
-        insert into slack_sync_channels (channel_id, channel_name, is_private) values
-            ('C_ALPHA', 'alpha', false),
-            ('C_BETA', 'beta', false),
-            ('C_ADMIN', 'admin', false),
-            ('G_PRIVATE', 'private', true),
-            ('G_PRIVATE_OTHER', 'private-other', true),
-            ('G_PRIVATE_INACTIVE', 'private-inactive', true),
-            ('G_PRIVATE_CROSS_TEAM', 'private-cross-team', true);
+        insert into slack_sync_channels
+            (channel_id, channel_name, is_private, is_syncable)
+        values
+            ('C_ALPHA', 'alpha', false, true),
+            ('C_BETA', 'beta', false, true),
+            ('C_ADMIN', 'admin', false, true),
+            ('C_EXCLUDED', 'excluded', false, false),
+            ('G_PRIVATE', 'private', true, true),
+            ('G_PRIVATE_OTHER', 'private-other', true, true),
+            ('G_PRIVATE_INACTIVE', 'private-inactive', true, true),
+            ('G_PRIVATE_CROSS_TEAM', 'private-cross-team', true, true);
 
         insert into slack_sync_users (user_id, user_name, team_id, raw_payload) values
             ('U_ALPHA', 'alpha user', '', '{}'),
@@ -1151,6 +1174,7 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
         insert into slack_sync_messages (channel_id, message_ts, user_id, text) values
             ('C_ALPHA', '1000.000001', 'U_ALPHA', 'alpha channel message'),
             ('C_BETA', '1000.000002', 'U_BETA', 'beta channel message'),
+            ('C_EXCLUDED', '1000.000004', 'U_ALPHA', 'excluded channel message'),
             ('G_PRIVATE', '1000.000003', 'U_PRIVATE', 'private channel message');
 
         insert into slack_sync_message_attachments
@@ -1165,6 +1189,7 @@ async fn insert_fixture_rows(conn: &mut PgConnection) -> Result<(), sqlx::Error>
         values
             ('doc_slack_alpha', 'slack', 'slack_thread', 'C_ALPHA:1000.000001', '{"channel_id": "C_ALPHA"}'),
             ('doc_slack_beta', 'slack', 'slack_thread', 'C_BETA:1000.000002', '{"channel_id": "C_BETA"}'),
+            ('doc_slack_excluded', 'slack', 'slack_thread', 'C_EXCLUDED:1000.000004', '{"channel_id": "C_EXCLUDED"}'),
             ('doc_slack_private', 'slack', 'slack_thread', 'G_PRIVATE:1000.000003', '{"channel_id": "G_PRIVATE"}'),
             ('doc_slack_private_other', 'slack', 'slack_thread', 'G_PRIVATE_OTHER:1000.000004', '{"channel_id": "G_PRIVATE_OTHER"}'),
             ('doc_slack_private_inactive', 'slack', 'slack_thread', 'G_PRIVATE_INACTIVE:1000.000005', '{"channel_id": "G_PRIVATE_INACTIVE"}'),
