@@ -26,6 +26,7 @@ use cron::Schedule;
 use futures_util::{StreamExt, TryStreamExt, pin_mut, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -46,6 +47,8 @@ pub const WORKFLOW_SCHEDULE_TASK: &str = "centaur.workflow.schedule_tick";
 const PYTHON_HOST_ENV: &str = "PYTHON_WORKFLOW_HOST_PATH";
 const PYTHON_HOST_INTERPRETER_ENV: &str = "PYTHON_WORKFLOW_HOST_PYTHON";
 const WORKFLOW_TOOL_API_URL_ENV: &str = "WORKFLOW_TOOL_API_URL";
+const WORKFLOW_TOOL_ALLOWLIST_ENV: &str = "WORKFLOW_TOOL_ALLOWLIST_JSON";
+const MAX_WORKFLOW_TOOL_IDENTIFIER_BYTES: usize = 128;
 const DEFAULT_AGENT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_MAX_DURATION_MS: u64 = 30 * 60 * 1_000;
 const DEFAULT_AGENT_BATCH_CONCURRENCY: usize = 4;
@@ -56,6 +59,7 @@ const WORKFLOW_HOST_CLAIM_EXTENSION: Duration = Duration::from_secs(5 * 60);
 const WORKFLOW_HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const WORKFLOW_RECONCILE_INTERVAL_SECS_ENV: &str = "WORKFLOW_RECONCILE_INTERVAL_SECS";
 const DEFAULT_WORKFLOW_RECONCILE_INTERVAL_SECS: u64 = 60;
+const SCHEDULE_FIRST_REGISTRATION_CATCH_UP_GRACE_SECS: i64 = 60;
 const WORKFLOW_ENABLE_MODE_ENV: &str = "WORKFLOW_ENABLE_MODE";
 const WORKFLOW_ALLOWED_NAMES_ENV: &str = "WORKFLOW_ALLOWED_NAMES";
 const MAX_LIST_RUNS_LIMIT: i64 = 1_000;
@@ -64,6 +68,8 @@ const MAX_LIST_RUNS_LIMIT: i64 = 1_000;
 const WORKFLOW_REAP_REMOVED_AFTER_TICKS_ENV: &str = "WORKFLOW_REAP_REMOVED_AFTER_TICKS";
 const DEFAULT_WORKFLOW_REAP_REMOVED_AFTER_TICKS: u32 = 3;
 const ABSURD_TERMINAL_TASK_STATES: &str = "('completed', 'failed', 'cancelled')";
+const SLACK_RECONCILIATION_PAGE_LIMIT: &str = "100";
+const MAX_SLACK_RECONCILIATION_PAGES: usize = 3;
 
 pub fn python_workflow_event_name(event_type: &str, correlation_id: &str) -> String {
     // JSON string encoding is unambiguous even when either component contains a delimiter.
@@ -116,6 +122,14 @@ struct WorkflowRuntimeInner {
     _schedule_worker: Worker,
     webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
     schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
+    event_trigger_registry: Arc<RwLock<Vec<RegisteredWorkflowEventTrigger>>>,
+}
+
+#[derive(Clone)]
+struct WorkflowMetadataRegistries {
+    webhooks: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
+    schedules: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
+    event_triggers: Arc<RwLock<Vec<RegisteredWorkflowEventTrigger>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +201,9 @@ impl WorkflowEnablement {
         metadata
             .webhooks
             .retain(|webhook| self.is_enabled(&webhook.workflow_name));
+        metadata
+            .event_triggers
+            .retain(|trigger| self.is_enabled(&trigger.workflow_name));
         metadata.schedules.retain(|schedule| {
             schedule
                 .get("workflow_name")
@@ -410,6 +427,19 @@ pub struct WorkflowWebhookSpec {
     pub filter: Option<WebhookFilter>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RegisteredWorkflowEventTrigger {
+    pub workflow_name: String,
+    pub source_path: String,
+    pub spec: WorkflowEventTriggerSpec,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkflowEventTriggerSpec {
+    pub name: String,
+    pub event_name_prefix: String,
+}
+
 /// A declarative webhook pre-filter, evaluated in-process before a run is
 /// created. A node is either a boolean combinator (`any`/`all`) or a leaf that
 /// reads a `header` or a dot-path into the JSON `body` and applies `op`
@@ -625,6 +655,10 @@ impl WorkflowRuntime {
             &discovery,
             &enablement,
         )?));
+        let event_trigger_registry = Arc::new(RwLock::new(build_event_trigger_registry(
+            &discovery,
+            &enablement,
+        )?));
 
         let task_session_runtime = session_runtime.clone();
         let task_workflow_host_sandbox = workflow_host_sandbox.clone();
@@ -804,8 +838,11 @@ impl WorkflowRuntime {
             spawn_workflow_metadata_reconciler(
                 schedule_client.clone(),
                 workflow_clients,
-                webhook_registry.clone(),
-                schedule_registry.clone(),
+                WorkflowMetadataRegistries {
+                    webhooks: webhook_registry.clone(),
+                    schedules: schedule_registry.clone(),
+                    event_triggers: event_trigger_registry.clone(),
+                },
                 workflow_host_sandbox.clone(),
                 workflow_principal_registrar,
                 interval,
@@ -825,6 +862,7 @@ impl WorkflowRuntime {
                 _schedule_worker: schedule_worker,
                 webhook_registry,
                 schedule_registry,
+                event_trigger_registry,
             }),
         })
     }
@@ -999,6 +1037,39 @@ impl WorkflowRuntime {
         event_name: &str,
         payload: Value,
     ) -> Result<(), WorkflowRuntimeError> {
+        self.emit_event_with_idempotency(event_name, payload, None)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn emit_event_with_idempotency(
+        &self,
+        event_name: &str,
+        payload: Value,
+        idempotency_key: Option<&str>,
+    ) -> Result<Vec<CreateWorkflowRunResponse>, WorkflowRuntimeError> {
+        let event_name = event_name.trim();
+        if event_name.is_empty() {
+            return Err(WorkflowRuntimeError::BadRequest(
+                "event_name must not be empty".to_owned(),
+            ));
+        }
+        let matching_triggers = self
+            .inner
+            .event_trigger_registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|trigger| event_name.starts_with(&trigger.spec.event_name_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let idempotency_key = idempotency_key.map(str::trim).filter(|key| !key.is_empty());
+        if !matching_triggers.is_empty() && idempotency_key.is_none() {
+            return Err(WorkflowRuntimeError::BadRequest(
+                "idempotency_key is required when an event starts workflows".to_owned(),
+            ));
+        }
+
         self.inner
             .client
             .emit_event(event_name, payload.clone(), Some(WORKFLOW_QUEUE))
@@ -1013,9 +1084,30 @@ impl WorkflowRuntime {
             .await?;
         self.inner
             .etl_backfill_client
-            .emit_event(event_name, payload, Some(WORKFLOW_ETL_BACKFILL_QUEUE))
+            .emit_event(
+                event_name,
+                payload.clone(),
+                Some(WORKFLOW_ETL_BACKFILL_QUEUE),
+            )
             .await?;
-        Ok(())
+
+        let mut runs = Vec::with_capacity(matching_triggers.len());
+        for trigger in matching_triggers {
+            let digest = Sha256::digest(
+                format!("{}:{}", trigger.spec.name, idempotency_key.unwrap()).as_bytes(),
+            );
+            let response = self
+                .create_run(CreateWorkflowRunRequest {
+                    workflow_name: trigger.workflow_name,
+                    input: json!({"event_name": event_name, "payload": payload.clone()}),
+                    idempotency_key: Some(format!("event-trigger:{}", hex::encode(digest))),
+                    harness_type: None,
+                    max_attempts: Some(3),
+                })
+                .await?;
+            runs.push(response);
+        }
+        Ok(runs)
     }
 
     pub fn get_webhook(&self, slug: &str) -> Option<RegisteredWorkflowWebhook> {
@@ -1073,6 +1165,7 @@ fn workflow_queue_class(workflow_name: &str) -> WorkflowQueueClass {
         | "google_drive_sync"
         | "linear_sync"
         | "company_context_documents"
+        | "company_context_embeddings"
         | "slack_retention"
         | "chief_of_staff_daily" => WorkflowQueueClass::Etl,
         _ => WorkflowQueueClass::Standard,
@@ -1167,6 +1260,48 @@ fn build_schedule_registry(
             )));
         }
     }
+    Ok(registry)
+}
+
+fn build_event_trigger_registry(
+    discovery: &PythonWorkflowMetadata,
+    enablement: &WorkflowEnablement,
+) -> Result<Vec<RegisteredWorkflowEventTrigger>, WorkflowRuntimeError> {
+    let mut names = BTreeSet::new();
+    let mut registry = Vec::new();
+    for mut trigger in discovery.event_triggers.clone() {
+        if !enablement.is_enabled(&trigger.workflow_name) {
+            continue;
+        }
+        trigger.workflow_name = trigger.workflow_name.trim().to_owned();
+        trigger.spec.name = trigger.spec.name.trim().to_owned();
+        trigger.spec.event_name_prefix = trigger.spec.event_name_prefix.trim().to_owned();
+        if trigger.workflow_name.is_empty() {
+            return Err(WorkflowRuntimeError::BadRequest(
+                "workflow event trigger workflow_name must not be empty".to_owned(),
+            ));
+        }
+        if trigger.spec.name.is_empty() || trigger.spec.name.len() > 128 {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflow event trigger name must contain 1..=128 bytes, got {:?}",
+                trigger.spec.name
+            )));
+        }
+        if trigger.spec.event_name_prefix.is_empty() || trigger.spec.event_name_prefix.len() > 256 {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "workflow event trigger {:?} event_name_prefix must contain 1..=256 bytes",
+                trigger.spec.name
+            )));
+        }
+        if !names.insert(trigger.spec.name.clone()) {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "duplicate workflow event trigger name {:?}",
+                trigger.spec.name
+            )));
+        }
+        registry.push(trigger);
+    }
+    registry.sort_by(|left, right| left.spec.name.cmp(&right.spec.name));
     Ok(registry)
 }
 
@@ -1672,6 +1807,8 @@ struct PythonWorkflowDiscovery {
     #[serde(default)]
     webhooks: Vec<RegisteredWorkflowWebhook>,
     #[serde(default)]
+    event_triggers: Vec<RegisteredWorkflowEventTrigger>,
+    #[serde(default)]
     schedule: Option<Value>,
     #[serde(default)]
     principal: Option<PythonWorkflowPrincipal>,
@@ -1692,6 +1829,7 @@ struct PythonWorkflowDiscoveryPayload {
 #[derive(Debug, Default)]
 struct PythonWorkflowMetadata {
     webhooks: Vec<RegisteredWorkflowWebhook>,
+    event_triggers: Vec<RegisteredWorkflowEventTrigger>,
     schedules: Vec<Value>,
     workflow_names: BTreeSet<String>,
     principals: BTreeMap<String, WorkflowPrincipalDeclaration>,
@@ -1706,6 +1844,7 @@ fn metadata_from_discovery_payload(
             .workflow_names
             .insert(workflow.workflow_name.clone());
         metadata.webhooks.extend(workflow.webhooks);
+        metadata.event_triggers.extend(workflow.event_triggers);
         if let Some(mut schedule) = workflow.schedule {
             if let Some(object) = schedule.as_object_mut() {
                 object
@@ -1915,8 +2054,7 @@ fn parse_worker_concurrency(raw: Option<&str>, default: usize) -> usize {
 fn spawn_workflow_metadata_reconciler(
     schedule_client: Client,
     workflow_clients: WorkflowQueueClients,
-    webhook_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
-    schedule_registry: Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
+    registries: WorkflowMetadataRegistries,
     workflow_host_sandbox: Option<WorkflowHostSandboxRuntime>,
     workflow_principal_registrar: WorkflowPrincipalRegistrar,
     interval: Duration,
@@ -1931,8 +2069,7 @@ fn spawn_workflow_metadata_reconciler(
             ticker.tick().await;
             match reconcile_workflow_metadata_once(
                 &schedule_client,
-                &webhook_registry,
-                &schedule_registry,
+                &registries,
                 workflow_host_sandbox.as_ref(),
                 &workflow_principal_registrar,
             )
@@ -1968,8 +2105,7 @@ fn spawn_workflow_metadata_reconciler(
 
 async fn reconcile_workflow_metadata_once(
     schedule_client: &Client,
-    webhook_registry: &Arc<RwLock<BTreeMap<String, RegisteredWorkflowWebhook>>>,
-    schedule_registry: &Arc<RwLock<BTreeMap<String, RegisteredWorkflowSchedule>>>,
+    registries: &WorkflowMetadataRegistries,
     workflow_host_sandbox: Option<&WorkflowHostSandboxRuntime>,
     workflow_principal_registrar: &WorkflowPrincipalRegistrar,
 ) -> Result<
@@ -1983,6 +2119,7 @@ async fn reconcile_workflow_metadata_once(
     let discovery = discover_python_workflow_metadata().await?;
     let next_webhooks = build_webhook_registry(&discovery, &enablement)?;
     let next_schedules = build_schedule_registry(&discovery, &enablement)?;
+    let next_event_triggers = build_event_trigger_registry(&discovery, &enablement)?;
     if let Some(sandbox) = workflow_host_sandbox {
         reconcile_workflow_principals(
             sandbox,
@@ -1993,21 +2130,31 @@ async fn reconcile_workflow_metadata_once(
         .await?;
     }
     {
-        let mut webhooks = webhook_registry
+        let mut webhooks = registries
+            .webhooks
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *webhooks = next_webhooks;
     }
     {
-        let mut schedules = schedule_registry
+        let mut schedules = registries
+            .schedules
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *schedules = next_schedules.clone();
+    }
+    {
+        let mut event_triggers = registries
+            .event_triggers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *event_triggers = next_event_triggers;
     }
     reconcile_schedules(schedule_client, &next_schedules).await?;
     info!(
         webhook_count = discovery.webhooks.len(),
         schedule_count = discovery.schedules.len(),
+        event_trigger_count = discovery.event_triggers.len(),
         "reconciled workflow metadata"
     );
     Ok((discovery, next_schedules))
@@ -2406,13 +2553,10 @@ async fn run_schedule_tick(
             WORKFLOW_TASK,
             WorkflowTaskInput {
                 workflow_name: schedule.workflow_name.clone(),
-                input: schedule.input.clone(),
+                input: schedule_workflow_input(&schedule, input.scheduled_at),
                 harness_type: HarnessType::Codex,
             },
-            SpawnOptions {
-                idempotency_key: Some(fire_key.clone()),
-                ..SpawnOptions::default()
-            },
+            scheduled_workflow_spawn_options(fire_key.clone()),
         )
         .await?;
     let next_run_at = next_schedule_time_after_tick(&schedule, input.scheduled_at, Utc::now())
@@ -2432,30 +2576,84 @@ async fn run_schedule_tick(
     }))
 }
 
+fn schedule_workflow_input(
+    schedule: &RegisteredWorkflowSchedule,
+    scheduled_at: DateTime<Utc>,
+) -> Value {
+    let scheduled_for = scheduled_at.to_rfc3339();
+    let mut input = schedule.input.as_object().cloned().unwrap_or_default();
+    input.insert("scheduled_for".to_owned(), json!(&scheduled_for));
+
+    let metadata = input.entry("metadata").or_insert_with(|| json!({}));
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    let metadata = metadata
+        .as_object_mut()
+        .expect("metadata was normalized to an object");
+    metadata.insert("source".to_owned(), json!("workflow_schedule"));
+    metadata.insert("workflow_name".to_owned(), json!(&schedule.workflow_name));
+    metadata.insert("no_delivery".to_owned(), json!(schedule.no_delivery));
+    metadata.insert("schedule_id".to_owned(), json!(&schedule.schedule_id));
+    metadata.insert("scheduled_for".to_owned(), json!(&scheduled_for));
+
+    Value::Object(input)
+}
+
+fn scheduled_workflow_spawn_options(idempotency_key: String) -> SpawnOptions {
+    // Scheduled workflows may call Slack, tools, or source systems. Centaur
+    // has checkpoints but no durable external-effect ledger, so a failed
+    // attempt cannot prove that replay is side-effect free. Fail closed until
+    // that ledger exists; manual/event workflows retain their normal policy.
+    SpawnOptions {
+        idempotency_key: Some(idempotency_key),
+        max_attempts: Some(1),
+        ..SpawnOptions::default()
+    }
+}
+
 async fn ensure_schedule_tick(
     client: &Client,
     schedule: &RegisteredWorkflowSchedule,
     scheduled_at: DateTime<Utc>,
 ) -> Result<bool, WorkflowRuntimeError> {
-    if has_active_schedule_tick(client, &schedule.schedule_id).await? {
+    let now = Utc::now();
+    let latest = latest_schedule_tick(client, &schedule.schedule_id).await?;
+    if schedule_tick_is_active(latest.as_ref()) {
         return Ok(false);
     }
-    spawn_schedule_tick(client, schedule, scheduled_at).await?;
+    let occurrence = schedule_reconcile_occurrence(schedule, scheduled_at, now, latest)?;
+    spawn_schedule_tick(client, schedule, occurrence).await?;
     Ok(true)
 }
 
-async fn has_active_schedule_tick(
+#[derive(Debug, Clone)]
+struct ScheduleTickRecord {
+    state: String,
+    scheduled_at: DateTime<Utc>,
+}
+
+fn is_terminal_task_state(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "cancelled")
+}
+
+fn schedule_tick_is_active(tick: Option<&ScheduleTickRecord>) -> bool {
+    tick.is_some_and(|tick| !is_terminal_task_state(&tick.state))
+}
+
+async fn latest_schedule_tick(
     client: &Client,
     schedule_id: &str,
-) -> Result<bool, WorkflowRuntimeError> {
+) -> Result<Option<ScheduleTickRecord>, WorkflowRuntimeError> {
     let (task_table, _) = absurd_queue_tables(WORKFLOW_SCHEDULE_QUEUE)?;
     let row = sqlx::query(&format!(
         r#"
-        select 1
+        select state, (params->>'scheduled_at')::timestamptz as scheduled_at
         from {task_table} t
         where t.task_name = $1
           and t.params->>'schedule_id' = $2
-          and t.state not in {ABSURD_TERMINAL_TASK_STATES}
+          and t.params ? 'scheduled_at'
+        order by (t.params->>'scheduled_at')::timestamptz desc
         limit 1
         "#,
     ))
@@ -2463,7 +2661,81 @@ async fn has_active_schedule_tick(
     .bind(schedule_id)
     .fetch_optional(client.pool())
     .await?;
-    Ok(row.is_some())
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let state: String = row.try_get("state").map_err(|error| {
+        WorkflowRuntimeError::Internal(format!("failed to read schedule tick state: {error}"))
+    })?;
+    let scheduled_at: DateTime<Utc> = row.try_get("scheduled_at").map_err(|error| {
+        WorkflowRuntimeError::Internal(format!("failed to read schedule tick time: {error}"))
+    })?;
+    Ok(Some(ScheduleTickRecord {
+        state,
+        scheduled_at,
+    }))
+}
+
+fn schedule_reconcile_occurrence(
+    schedule: &RegisteredWorkflowSchedule,
+    next_future: DateTime<Utc>,
+    now: DateTime<Utc>,
+    latest: Option<ScheduleTickRecord>,
+) -> Result<DateTime<Utc>, WorkflowRuntimeError> {
+    let WorkflowScheduleKind::Cron { .. } = schedule.kind else {
+        return Ok(next_future);
+    };
+    let missed = latest_cron_occurrence_at_or_before(schedule, now)?;
+    if latest
+        .as_ref()
+        .is_some_and(|tick| tick.scheduled_at < missed)
+        || (latest.is_none()
+            && now.signed_duration_since(missed).num_seconds()
+                <= SCHEDULE_FIRST_REGISTRATION_CATCH_UP_GRACE_SECS)
+    {
+        // Coalesce all downtime into the newest missed occurrence. The tick
+        // itself advances to the next future occurrence after it runs. A
+        // schedule with no durable history gets this only during the short
+        // first-registration grace window.
+        return Ok(missed);
+    }
+    Ok(next_future)
+}
+
+fn latest_cron_occurrence_at_or_before(
+    schedule: &RegisteredWorkflowSchedule,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, WorkflowRuntimeError> {
+    let WorkflowScheduleKind::Cron { cron } = &schedule.kind else {
+        return Err(WorkflowRuntimeError::Internal(
+            "latest cron occurrence requested for an interval schedule".to_owned(),
+        ));
+    };
+    let timezone = schedule.timezone.parse::<Tz>().map_err(|error| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "invalid timezone {:?} for schedule {:?}: {error}",
+            schedule.timezone, schedule.schedule_id
+        ))
+    })?;
+    let parsed = Schedule::from_str(&normalize_cron_expression(cron)).map_err(|error| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "invalid cron {:?} for schedule {:?}: {error}",
+            cron, schedule.schedule_id
+        ))
+    })?;
+    // `next_back` uses cron's DST-aware `prev_from` implementation. Starting
+    // one second after `now` makes an occurrence exactly at `now` eligible,
+    // while preserving the configured timezone and repeated fall-back hour.
+    parsed
+        .after(&(now.with_timezone(&timezone) + chrono::Duration::seconds(1)))
+        .next_back()
+        .map(|previous| previous.with_timezone(&Utc))
+        .ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(format!(
+                "cron {:?} for schedule {:?} produced no previous run",
+                cron, schedule.schedule_id
+            ))
+        })
 }
 
 async fn spawn_schedule_tick(
@@ -2484,6 +2756,8 @@ async fn spawn_schedule_tick(
                     schedule.schedule_id,
                     scheduled_at.to_rfc3339()
                 )),
+                // The tick only enqueues an idempotent occurrence. Keep the
+                // durable scheduler retry policy for transient queue errors.
                 max_attempts: Some(10),
                 retry_strategy: Some(RetryStrategy {
                     kind: RetryKind::Fixed,
@@ -3054,11 +3328,6 @@ async fn run_python_workflow_host_in_sandbox(
     if env::var_os("WORKFLOW_DIRS").is_none() && !sandbox_spec_has_env(&spec, "WORKFLOW_DIRS") {
         spec = spec.env("WORKFLOW_DIRS", default_workflow_dirs());
     }
-    if let Ok(database_url) = env::var("DATABASE_URL")
-        && !sandbox_spec_has_env(&spec, "DATABASE_URL")
-    {
-        spec = spec.env("DATABASE_URL", database_url);
-    }
     let (sandbox_id, io) = sandbox.runtime.create_running_io(spec).await?;
     let mut stdin = io.stdin;
     let stderr_task = tokio::spawn(async move {
@@ -3420,16 +3689,28 @@ async fn handle_python_context_request(
                 Err(error) => Err(error.to_string()),
             }
         }
-        Some("ctx.call_tool") => match call_python_workflow_tool(message).await {
-            Ok(value) => Ok(value),
-            Err(error) => Err(error.to_string()),
-        },
+        Some("ctx.call_tool") => {
+            // The task input is supplied by api-rs. Do not use a workflow-supplied
+            // identity field from the RPC message when selecting authorization.
+            match call_python_workflow_tool(&input.workflow_name, message).await {
+                Ok(value) => Ok(value),
+                Err(error) => Err(error.to_string()),
+            }
+        }
         Some("ctx.post_to_slack") => {
             match post_python_slack_message(message, ctx, &request_id).await {
                 Ok(value) => Ok(value),
                 Err(error) => Err(error.to_string()),
             }
         }
+        Some("ctx.update_slack") => match update_python_slack_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
+        Some("ctx.find_slack_message") => match find_python_slack_message(message).await {
+            Ok(value) => Ok(value),
+            Err(error) => Err(error.to_string()),
+        },
         other => Err(format!("unsupported context request type {other:?}")),
     };
     Ok(match result {
@@ -4015,7 +4296,135 @@ fn run_time_now_tool() -> ToolResult {
     }
 }
 
-async fn call_python_workflow_tool(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+type WorkflowToolAllowlist = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+
+fn validate_workflow_tool_identifier(kind: &str, value: &str) -> Result<(), WorkflowRuntimeError> {
+    let invalid = || {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{WORKFLOW_TOOL_ALLOWLIST_ENV} contains an invalid {kind} identifier"
+        ))
+    };
+    if value.is_empty()
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+        || value.len() > MAX_WORKFLOW_TOOL_IDENTIFIER_BYTES
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn parse_workflow_tool_allowlist(raw: &str) -> Result<WorkflowToolAllowlist, WorkflowRuntimeError> {
+    let value: Value = serde_json::from_str(raw.trim()).map_err(|_| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{WORKFLOW_TOOL_ALLOWLIST_ENV} must be valid JSON"
+        ))
+    })?;
+    let workflows = value.as_object().ok_or_else(|| {
+        WorkflowRuntimeError::BadRequest(format!(
+            "{WORKFLOW_TOOL_ALLOWLIST_ENV} must be a JSON object"
+        ))
+    })?;
+    let mut allowlist = BTreeMap::new();
+    for (workflow_name, raw_tools) in workflows {
+        validate_workflow_tool_identifier("workflow", workflow_name)?;
+        let tools = raw_tools.as_object().ok_or_else(|| {
+            WorkflowRuntimeError::BadRequest(format!(
+                "{WORKFLOW_TOOL_ALLOWLIST_ENV} workflow entries must be JSON objects"
+            ))
+        })?;
+        let mut parsed_tools = BTreeMap::new();
+        for (tool_name, raw_methods) in tools {
+            validate_workflow_tool_identifier("tool", tool_name)?;
+            let methods = raw_methods.as_array().ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(format!(
+                    "{WORKFLOW_TOOL_ALLOWLIST_ENV} tool entries must be arrays"
+                ))
+            })?;
+            let mut parsed_methods = BTreeSet::new();
+            for raw_method in methods {
+                let method = raw_method.as_str().ok_or_else(|| {
+                    WorkflowRuntimeError::BadRequest(format!(
+                        "{WORKFLOW_TOOL_ALLOWLIST_ENV} methods must be strings"
+                    ))
+                })?;
+                validate_workflow_tool_identifier("method", method)?;
+                parsed_methods.insert(method.to_owned());
+            }
+            parsed_tools.insert(tool_name.to_owned(), parsed_methods);
+        }
+        allowlist.insert(workflow_name.to_owned(), parsed_tools);
+    }
+    Ok(allowlist)
+}
+
+fn workflow_tool_allowlist_from_env() -> Result<Option<WorkflowToolAllowlist>, WorkflowRuntimeError>
+{
+    let raw = match env::var(WORKFLOW_TOOL_ALLOWLIST_ENV) {
+        Ok(raw) => raw,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "{WORKFLOW_TOOL_ALLOWLIST_ENV} must be valid UTF-8"
+            )));
+        }
+    };
+    parse_workflow_tool_allowlist(&raw).map(Some)
+}
+
+fn workflow_tool_method_allowed(
+    allowlist: Option<&WorkflowToolAllowlist>,
+    workflow_name: &str,
+    tool: &str,
+    method: &str,
+) -> bool {
+    let Some(allowlist) = allowlist else {
+        return true;
+    };
+    let Some(tools) = allowlist.get(workflow_name) else {
+        return true;
+    };
+    tools
+        .get(tool)
+        .is_some_and(|methods| methods.contains(method))
+}
+
+fn authorize_workflow_tool_method(
+    workflow_name: &str,
+    tool: &str,
+    method: &str,
+) -> Result<(), WorkflowRuntimeError> {
+    let allowlist = workflow_tool_allowlist_from_env()?;
+    if workflow_tool_method_allowed(allowlist.as_ref(), workflow_name, tool, method) {
+        return Ok(());
+    }
+    Err(WorkflowRuntimeError::Disabled(
+        "ctx.call_tool tool/method is not allowed for this workflow".to_owned(),
+    ))
+}
+
+fn tool_proxy_transport_error() -> WorkflowRuntimeError {
+    WorkflowRuntimeError::Upstream("ctx.call_tool proxy_transport_error".to_owned())
+}
+
+fn tool_proxy_http_error(status: reqwest::StatusCode) -> WorkflowRuntimeError {
+    WorkflowRuntimeError::Upstream(format!(
+        "ctx.call_tool proxy_http_error status={}",
+        status.as_u16()
+    ))
+}
+
+fn tool_proxy_json_error(status: reqwest::StatusCode) -> WorkflowRuntimeError {
+    WorkflowRuntimeError::Upstream(format!(
+        "ctx.call_tool proxy_invalid_json status={}",
+        status.as_u16()
+    ))
+}
+
+async fn call_python_workflow_tool(
+    workflow_name: &str,
+    message: &Value,
+) -> Result<Value, WorkflowRuntimeError> {
     let tool = message
         .get("tool")
         .and_then(Value::as_str)
@@ -4036,25 +4445,29 @@ async fn call_python_workflow_tool(message: &Value) -> Result<Value, WorkflowRun
     if tool == "time" && matches!(method, "now" | "time_now") {
         return serde_json::to_value(run_time_now_tool()).map_err(WorkflowRuntimeError::from);
     }
+    authorize_workflow_tool_method(workflow_name, tool, method)?;
 
     let base_url = env::var(WORKFLOW_TOOL_API_URL_ENV).map_err(|_| {
         WorkflowRuntimeError::BadRequest(format!(
-            "{WORKFLOW_TOOL_API_URL_ENV} must be set for ctx.call_tool({tool}.{method})"
+            "{WORKFLOW_TOOL_API_URL_ENV} must be set for ctx.call_tool"
         ))
     })?;
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/tools/{tool}/{method}");
     let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
     let request = reqwest::Client::new().post(&url).json(&args);
-    let response = request.send().await?;
+    let response = request
+        .send()
+        .await
+        .map_err(|_| tool_proxy_transport_error())?;
     let status = response.status();
-    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
     if !status.is_success() {
-        return Err(WorkflowRuntimeError::BadRequest(format!(
-            "ctx.call_tool({tool}.{method}) failed with status {status}: {body}"
-        )));
+        return Err(tool_proxy_http_error(status));
     }
-    Ok(body)
+    response
+        .json()
+        .await
+        .map_err(|_| tool_proxy_json_error(status))
 }
 
 async fn post_tool_result_to_slack(
@@ -4124,6 +4537,258 @@ async fn post_python_slack_message(
         .map_err(WorkflowRuntimeError::from)
 }
 
+async fn update_python_slack_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let channel = required_python_string(message, "channel", "ctx.update_slack")?;
+    let ts = required_python_string(message, "ts", "ctx.update_slack")?;
+    let text = required_python_string(message, "text", "ctx.update_slack")?;
+    let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
+    let payload = python_slack_update_payload(channel, ts, text, &args)?;
+
+    let token = env::var("SLACK_BOT_TOKEN")
+        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
+        .map_err(|_| {
+            WorkflowRuntimeError::BadRequest(
+                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
+            )
+        })?;
+    let response = send_slack_update(&token, payload).await?;
+    serde_json::to_value(slack_update_result_from_response(channel, ts, response))
+        .map_err(WorkflowRuntimeError::from)
+}
+
+fn validate_slack_reconciliation_field(
+    message: &Value,
+    field: &str,
+    operation: &str,
+    max_bytes: usize,
+) -> Result<String, WorkflowRuntimeError> {
+    let value = message
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkflowRuntimeError::BadRequest(format!("{operation} requires {field}")))?;
+    if value.trim().is_empty()
+        || value.len() > max_bytes
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(WorkflowRuntimeError::BadRequest(format!(
+            "{operation} requires a valid {field}"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_slack_reconciliation_thread_ts(value: &str) -> Result<(), WorkflowRuntimeError> {
+    let mut components = value.split('.');
+    let seconds = components.next().unwrap_or_default();
+    let fraction = components.next().unwrap_or_default();
+    if components.next().is_some()
+        || seconds.is_empty()
+        || fraction.is_empty()
+        || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "ctx.find_slack_message requires a valid thread_ts".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn slack_reconciliation_match(
+    channel: &str,
+    client_msg_id: &str,
+    thread_ts: Option<&str>,
+    messages: &Value,
+) -> Result<Option<Value>, WorkflowRuntimeError> {
+    let messages = messages.as_array().ok_or_else(|| {
+        WorkflowRuntimeError::Upstream(
+            "Slack reconciliation returned malformed messages".to_owned(),
+        )
+    })?;
+
+    for message in messages {
+        if !message.is_object() {
+            return Err(WorkflowRuntimeError::Upstream(
+                "Slack reconciliation returned malformed messages".to_owned(),
+            ));
+        }
+        if message.get("client_msg_id").and_then(Value::as_str) != Some(client_msg_id) {
+            continue;
+        }
+        if message
+            .get("channel")
+            .and_then(Value::as_str)
+            .is_some_and(|message_channel| message_channel != channel)
+        {
+            continue;
+        }
+        if let Some(thread_ts) = thread_ts {
+            let is_requested_thread = message.get("ts").and_then(Value::as_str) == Some(thread_ts)
+                || message.get("thread_ts").and_then(Value::as_str) == Some(thread_ts);
+            if !is_requested_thread {
+                continue;
+            }
+        }
+        let ts = message
+            .get("ts")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                WorkflowRuntimeError::Upstream(
+                    "Slack reconciliation returned a matching message without ts".to_owned(),
+                )
+            })?;
+        let mut result = json!({"found": true, "channel": channel, "ts": ts});
+        if let Some(message_thread_ts) = message
+            .get("thread_ts")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            result["thread_ts"] = json!(message_thread_ts);
+        }
+        return Ok(Some(result));
+    }
+    Ok(None)
+}
+
+fn slack_reconciliation_next_cursor(body: &Value) -> Result<Option<String>, WorkflowRuntimeError> {
+    let has_more = match body.get("has_more") {
+        None | Some(Value::Null) => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            WorkflowRuntimeError::Upstream(
+                "Slack reconciliation returned malformed pagination".to_owned(),
+            )
+        })?,
+    };
+    let next_cursor = match body.get("response_metadata") {
+        None | Some(Value::Null) => None,
+        Some(metadata) => {
+            let metadata = metadata.as_object().ok_or_else(|| {
+                WorkflowRuntimeError::Upstream(
+                    "Slack reconciliation returned malformed pagination".to_owned(),
+                )
+            })?;
+            match metadata.get("next_cursor") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(cursor)) if !cursor.trim().is_empty() => Some(cursor.to_owned()),
+                Some(Value::String(_)) => None,
+                Some(_) => {
+                    return Err(WorkflowRuntimeError::Upstream(
+                        "Slack reconciliation returned malformed pagination".to_owned(),
+                    ));
+                }
+            }
+        }
+    };
+    if has_more && next_cursor.is_none() {
+        return Err(WorkflowRuntimeError::Upstream(
+            "Slack reconciliation returned incomplete pagination".to_owned(),
+        ));
+    }
+    Ok(next_cursor)
+}
+
+fn slack_reconciliation_endpoint(thread_ts: Option<&str>) -> &'static str {
+    if thread_ts.is_some() {
+        "https://slack.com/api/conversations.replies"
+    } else {
+        "https://slack.com/api/conversations.history"
+    }
+}
+
+async fn find_python_slack_message(message: &Value) -> Result<Value, WorkflowRuntimeError> {
+    let operation = "ctx.find_slack_message";
+    let channel = validate_slack_reconciliation_field(message, "channel", operation, 255)?;
+    let client_msg_id =
+        validate_slack_reconciliation_field(message, "client_msg_id", operation, 512)?;
+    let thread_ts = message
+        .get("thread_ts")
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                WorkflowRuntimeError::BadRequest(format!("{operation} requires a valid thread_ts"))
+            })
+        })
+        .transpose()?;
+    if let Some(thread_ts) = thread_ts {
+        if thread_ts.trim().is_empty() || thread_ts.len() > 64 {
+            return Err(WorkflowRuntimeError::BadRequest(
+                "ctx.find_slack_message requires a valid thread_ts".to_owned(),
+            ));
+        }
+        validate_slack_reconciliation_thread_ts(thread_ts)?;
+    }
+
+    let token = env::var("SLACK_BOT_TOKEN")
+        .or_else(|_| env::var("SLACK_BOT_TOKEN_OVERRIDE"))
+        .map_err(|_| {
+            WorkflowRuntimeError::BadRequest(
+                "SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_OVERRIDE must be set".to_owned(),
+            )
+        })?;
+    let endpoint = slack_reconciliation_endpoint(thread_ts);
+    let client = reqwest::Client::new();
+    let mut cursor: Option<String> = None;
+
+    for page in 0..MAX_SLACK_RECONCILIATION_PAGES {
+        let mut url = reqwest::Url::parse(endpoint).map_err(|_| {
+            WorkflowRuntimeError::Internal("invalid Slack reconciliation endpoint".to_owned())
+        })?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("channel", &channel);
+            query.append_pair("limit", SLACK_RECONCILIATION_PAGE_LIMIT);
+            if let Some(thread_ts) = thread_ts {
+                query.append_pair("ts", thread_ts);
+            }
+            if let Some(cursor) = cursor.as_deref() {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        let request = client.get(url).bearer_auth(&token);
+
+        let response = request.send().await.map_err(|_| {
+            WorkflowRuntimeError::Upstream("Slack reconciliation lookup failed".to_owned())
+        })?;
+        if !response.status().is_success() {
+            return Err(WorkflowRuntimeError::Upstream(
+                "Slack reconciliation lookup failed".to_owned(),
+            ));
+        }
+        let body = response.json::<Value>().await.map_err(|_| {
+            WorkflowRuntimeError::Upstream(
+                "Slack reconciliation returned malformed response".to_owned(),
+            )
+        })?;
+        if body.get("ok") != Some(&Value::Bool(true)) {
+            return Err(WorkflowRuntimeError::Upstream(
+                "Slack reconciliation lookup failed".to_owned(),
+            ));
+        }
+        let messages = body.get("messages").ok_or_else(|| {
+            WorkflowRuntimeError::Upstream(
+                "Slack reconciliation returned malformed messages".to_owned(),
+            )
+        })?;
+        if let Some(result) =
+            slack_reconciliation_match(&channel, &client_msg_id, thread_ts, messages)?
+        {
+            return Ok(result);
+        }
+        cursor = slack_reconciliation_next_cursor(&body)?;
+        if cursor.is_none() {
+            return Ok(json!({"found": false, "channel": channel}));
+        }
+        if page + 1 == MAX_SLACK_RECONCILIATION_PAGES {
+            return Err(WorkflowRuntimeError::Upstream(
+                "Slack reconciliation lookup exceeded bounded pagination".to_owned(),
+            ));
+        }
+    }
+    Err(WorkflowRuntimeError::Upstream(
+        "Slack reconciliation lookup exceeded bounded pagination".to_owned(),
+    ))
+}
+
 fn python_slack_message_payload(
     channel: &str,
     text: &str,
@@ -4167,6 +4832,44 @@ fn python_slack_message_payload(
     payload
 }
 
+fn python_slack_update_payload(
+    channel: &str,
+    ts: &str,
+    text: &str,
+    args: &Value,
+) -> Result<Value, WorkflowRuntimeError> {
+    for (field, value) in [("channel", channel), ("ts", ts), ("text", text)] {
+        if value.trim().is_empty() {
+            return Err(WorkflowRuntimeError::BadRequest(format!(
+                "ctx.update_slack requires non-empty {field}"
+            )));
+        }
+    }
+    if !args.is_object() {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "ctx.update_slack args must be an object".to_owned(),
+        ));
+    }
+
+    let mut payload = json!({
+        "channel": channel,
+        "ts": ts,
+        "text": text,
+    });
+    // Keep this allowlist deliberately narrower than chat.postMessage. In
+    // particular, never forward caller-selected identity, token, or endpoint
+    // fields. `mrkdwn` is retained for heartbeat's common message contract.
+    if let Some(blocks) = args.get("blocks")
+        && blocks.is_array()
+    {
+        payload["blocks"] = blocks.clone();
+    }
+    if let Some(mrkdwn) = args.get("mrkdwn").and_then(Value::as_bool) {
+        payload["mrkdwn"] = json!(mrkdwn);
+    }
+    Ok(payload)
+}
+
 async fn send_slack_message(token: &str, payload: Value) -> Result<Value, WorkflowRuntimeError> {
     let response: Value = reqwest::Client::new()
         .post("https://slack.com/api/chat.postMessage")
@@ -4188,6 +4891,27 @@ async fn send_slack_message(token: &str, payload: Value) -> Result<Value, Workfl
     Ok(response)
 }
 
+async fn send_slack_update(token: &str, payload: Value) -> Result<Value, WorkflowRuntimeError> {
+    let response: Value = reqwest::Client::new()
+        .post("https://slack.com/api/chat.update")
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?
+        .json()
+        .await?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(WorkflowRuntimeError::Upstream(format!(
+            "Slack chat.update failed: {}",
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_error")
+        )));
+    }
+    Ok(response)
+}
+
 fn slack_post_result_from_response(channel: &str, response: Value) -> SlackPostResult {
     SlackPostResult {
         channel: response
@@ -4199,6 +4923,21 @@ fn slack_post_result_from_response(channel: &str, response: Value) -> SlackPostR
             .get("ts")
             .and_then(Value::as_str)
             .unwrap_or("")
+            .to_owned(),
+    }
+}
+
+fn slack_update_result_from_response(channel: &str, ts: &str, response: Value) -> SlackPostResult {
+    SlackPostResult {
+        channel: response
+            .get("channel")
+            .and_then(Value::as_str)
+            .unwrap_or(channel)
+            .to_owned(),
+        ts: response
+            .get("ts")
+            .and_then(Value::as_str)
+            .unwrap_or(ts)
             .to_owned(),
     }
 }
@@ -4822,6 +5561,197 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_cron_input_carries_the_authoritative_occurrence() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "hourly_report",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+            "no_delivery": true,
+            "input": {"report": "daily", "metadata": {"keep": "this"}},
+        }))
+        .unwrap();
+        let scheduled_at = Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap();
+        let child_input = schedule_workflow_input(&schedule, scheduled_at);
+        let scheduled_for = scheduled_at.to_rfc3339();
+
+        assert_eq!(child_input["report"], json!("daily"));
+        assert_eq!(child_input["scheduled_for"], json!(scheduled_for));
+        assert_eq!(
+            child_input["metadata"],
+            json!({
+                "keep": "this",
+                "source": "workflow_schedule",
+                "workflow_name": "hourly_report",
+                "no_delivery": true,
+                "schedule_id": "hourly_report",
+                "scheduled_for": scheduled_for,
+            })
+        );
+    }
+
+    #[test]
+    fn scheduled_cron_input_overwrites_caller_provenance_spoof() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "authoritative_schedule",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+            "no_delivery": true,
+            "input": {
+                "scheduled_for": "1999-01-01T00:00:00Z",
+                "metadata": {
+                    "schedule_id": "caller_schedule",
+                    "scheduled_for": "1999-01-01T00:00:00Z",
+                    "no_delivery": true,
+                },
+            },
+        }))
+        .unwrap();
+        let scheduled_at = Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap();
+        let child_input = schedule_workflow_input(&schedule, scheduled_at);
+        let scheduled_for = scheduled_at.to_rfc3339();
+
+        assert_eq!(child_input["scheduled_for"], json!(scheduled_for));
+        assert_eq!(
+            child_input["metadata"]["schedule_id"],
+            json!("authoritative_schedule")
+        );
+        assert_eq!(
+            child_input["metadata"]["scheduled_for"],
+            json!(scheduled_for)
+        );
+        assert_eq!(child_input["metadata"]["no_delivery"], json!(true));
+    }
+
+    #[test]
+    fn scheduled_input_rebuilds_authoritative_metadata_for_non_object_spoof() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "authoritative_schedule",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+            "no_delivery": true,
+            "input": {
+                "metadata": "caller-controlled metadata",
+                "scheduled_for": "1999-01-01T00:00:00Z"
+            },
+        }))
+        .unwrap();
+        let scheduled_at = Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap();
+        let child_input = schedule_workflow_input(&schedule, scheduled_at);
+        let scheduled_for = scheduled_at.to_rfc3339();
+
+        assert_eq!(
+            child_input["metadata"],
+            json!({
+                "source": "workflow_schedule",
+                "workflow_name": "hourly_report",
+                "no_delivery": true,
+                "schedule_id": "authoritative_schedule",
+                "scheduled_for": scheduled_for,
+            })
+        );
+    }
+
+    #[test]
+    fn coalesced_cron_occurrence_is_the_child_provenance() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "hourly_report",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+            "input": {"metadata": {"no_delivery": false}},
+        }))
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 16, 12, 25, 0).unwrap();
+        let latest = Some(ScheduleTickRecord {
+            state: "completed".to_owned(),
+            scheduled_at: Utc.with_ymd_and_hms(2026, 6, 16, 10, 0, 0).unwrap(),
+        });
+        let next_future = Utc.with_ymd_and_hms(2026, 6, 16, 13, 0, 0).unwrap();
+        let coalesced = schedule_reconcile_occurrence(&schedule, next_future, now, latest).unwrap();
+        let child_input = schedule_workflow_input(&schedule, coalesced);
+        let scheduled_for = coalesced.to_rfc3339();
+
+        assert_eq!(
+            coalesced,
+            Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap()
+        );
+        assert_eq!(child_input["scheduled_for"], json!(scheduled_for));
+        assert_eq!(
+            child_input["metadata"]["scheduled_for"],
+            json!(scheduled_for)
+        );
+        assert_eq!(
+            child_input["metadata"]["schedule_id"],
+            json!("hourly_report")
+        );
+    }
+
+    #[test]
+    fn scheduled_cron_input_formats_dst_occurrence_as_rfc3339_utc() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "daily_report",
+            "schedule_id": "daily_report",
+            "cron": "30 1 * * *",
+            "timezone": "America/Los_Angeles",
+            "enabled": true,
+        }))
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 1, 9, 35, 0).unwrap();
+        let scheduled_at = latest_cron_occurrence_at_or_before(&schedule, now).unwrap();
+        let child_input = schedule_workflow_input(&schedule, scheduled_at);
+        let scheduled_for = scheduled_at.to_rfc3339();
+
+        assert_eq!(
+            scheduled_at,
+            Utc.with_ymd_and_hms(2026, 11, 1, 9, 30, 0).unwrap()
+        );
+        assert_eq!(child_input["scheduled_for"], json!(scheduled_for));
+        assert_eq!(
+            child_input["metadata"]["scheduled_for"],
+            json!(scheduled_for)
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(child_input["scheduled_for"].as_str().unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn scheduled_interval_input_carries_occurrence_and_delivery_metadata() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "slack_backfill",
+            "schedule_id": "slack_backfill",
+            "interval_seconds": 600,
+            "enabled": true,
+            "no_delivery": true,
+            "input": {"batch": 4},
+        }))
+        .unwrap();
+        let scheduled_at = Utc.with_ymd_and_hms(2026, 6, 16, 12, 10, 0).unwrap();
+        let child_input = schedule_workflow_input(&schedule, scheduled_at);
+        let scheduled_for = scheduled_at.to_rfc3339();
+
+        assert_eq!(child_input["batch"], json!(4));
+        assert_eq!(child_input["scheduled_for"], json!(scheduled_for));
+        assert_eq!(
+            child_input["metadata"]["schedule_id"],
+            json!("slack_backfill")
+        );
+        assert_eq!(
+            child_input["metadata"]["scheduled_for"],
+            json!(scheduled_for)
+        );
+        assert_eq!(child_input["metadata"]["no_delivery"], json!(true));
+    }
+
+    #[test]
     fn cron_schedule_uses_configured_timezone() {
         let schedule = normalize_schedule(json!({
             "workflow_name": "chief_of_staff_daily",
@@ -4908,6 +5838,161 @@ mod tests {
     }
 
     #[test]
+    fn cron_reconcile_coalesces_downtime_to_one_latest_missed_occurrence() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "weekday_report",
+            "schedule_id": "weekday_report",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+        }))
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 16, 12, 25, 0).unwrap();
+        let next_future = Utc.with_ymd_and_hms(2026, 6, 16, 13, 0, 0).unwrap();
+        let latest = Some(ScheduleTickRecord {
+            state: "completed".to_owned(),
+            scheduled_at: Utc.with_ymd_and_hms(2026, 6, 16, 10, 0, 0).unwrap(),
+        });
+        assert_eq!(
+            schedule_reconcile_occurrence(&schedule, next_future, now, latest).unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn cron_reconcile_does_not_repeat_already_recorded_missed_occurrence() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "hourly_report",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+        }))
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 16, 12, 25, 0).unwrap();
+        let next_future = Utc.with_ymd_and_hms(2026, 6, 16, 13, 0, 0).unwrap();
+        let latest = Some(ScheduleTickRecord {
+            state: "completed".to_owned(),
+            scheduled_at: Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap(),
+        });
+
+        assert_eq!(
+            schedule_reconcile_occurrence(&schedule, next_future, now, latest).unwrap(),
+            next_future
+        );
+    }
+
+    #[test]
+    fn active_overdue_tick_blocks_a_second_reconciliation() {
+        let tick = ScheduleTickRecord {
+            state: "running".to_owned(),
+            scheduled_at: Utc.with_ymd_and_hms(2026, 6, 16, 10, 0, 0).unwrap(),
+        };
+        assert!(schedule_tick_is_active(Some(&tick)));
+        assert!(!schedule_tick_is_active(None));
+        assert!(!schedule_tick_is_active(Some(&ScheduleTickRecord {
+            state: "completed".to_owned(),
+            scheduled_at: tick.scheduled_at,
+        })));
+    }
+
+    #[test]
+    fn cron_reconcile_keeps_the_next_future_occurrence_on_time() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "hourly_report",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+        }))
+        .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap();
+        let next_future = Utc.with_ymd_and_hms(2026, 6, 16, 13, 0, 0).unwrap();
+        let latest = Some(ScheduleTickRecord {
+            state: "completed".to_owned(),
+            scheduled_at: Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap(),
+        });
+
+        assert_eq!(
+            schedule_reconcile_occurrence(&schedule, next_future, now, latest).unwrap(),
+            next_future
+        );
+    }
+
+    #[test]
+    fn cron_first_registration_catches_up_only_within_grace() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "hourly_report",
+            "cron": "0 * * * *",
+            "timezone": "UTC",
+            "enabled": true,
+        }))
+        .unwrap();
+        let next_future = Utc.with_ymd_and_hms(2026, 6, 16, 13, 0, 0).unwrap();
+        let within_grace = Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 30).unwrap();
+        assert_eq!(
+            schedule_reconcile_occurrence(&schedule, next_future, within_grace, None).unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap()
+        );
+
+        let outside_grace = Utc.with_ymd_and_hms(2026, 6, 16, 12, 2, 0).unwrap();
+        assert_eq!(
+            schedule_reconcile_occurrence(&schedule, next_future, outside_grace, None).unwrap(),
+            next_future
+        );
+    }
+
+    #[test]
+    fn cron_reconcile_preserves_dst_fallback_occurrence_timezone() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "daily_report",
+            "schedule_id": "daily_report",
+            "cron": "30 1 * * *",
+            "timezone": "America/Los_Angeles",
+            "enabled": true,
+        }))
+        .unwrap();
+        // 09:35 UTC is 01:35 PST after the 2026 fall-back transition.
+        let now = Utc.with_ymd_and_hms(2026, 11, 1, 9, 35, 0).unwrap();
+        assert_eq!(
+            latest_cron_occurrence_at_or_before(&schedule, now).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 1, 9, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn delayed_interval_tick_coalesces_multiple_intervals_once() {
+        let schedule = normalize_schedule(json!({
+            "workflow_name": "hourly_report",
+            "schedule_id": "hourly_report",
+            "interval_seconds": 600,
+            "enabled": true,
+        }))
+        .unwrap();
+        let scheduled_at = Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 16, 12, 35, 0).unwrap();
+        let next = next_schedule_time_after_tick(&schedule, scheduled_at, now).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 6, 16, 12, 40, 0).unwrap());
+        // Re-running the same tick uses the same scheduled occurrence and
+        // therefore computes the same single next future occurrence.
+        assert_eq!(
+            next_schedule_time_after_tick(&schedule, scheduled_at, now).unwrap(),
+            next
+        );
+    }
+
+    #[test]
+    fn scheduled_workflows_fail_closed_without_a_side_effect_ledger() {
+        let options = scheduled_workflow_spawn_options("schedule:test:occurrence".to_owned());
+        assert_eq!(options.max_attempts, Some(1));
+        assert_eq!(
+            options.idempotency_key.as_deref(),
+            Some("schedule:test:occurrence")
+        );
+    }
+
+    #[test]
     fn scheduled_etls_use_isolated_etl_queues() {
         assert_eq!(
             workflow_queue_class("slack_sync"),
@@ -4918,6 +6003,7 @@ mod tests {
             "google_drive_sync",
             "linear_sync",
             "company_context_documents",
+            "company_context_embeddings",
             "slack_retention",
             "chief_of_staff_daily",
         ] {
@@ -4975,6 +6061,207 @@ mod tests {
     }
 
     #[test]
+    fn python_slack_update_payload_forwards_only_safe_fields() {
+        let payload = python_slack_update_payload(
+            "C123",
+            "1710000000.000100",
+            "Heartbeat is healthy.",
+            &json!({
+                "blocks": [{"type": "section"}],
+                "mrkdwn": true,
+                "reply_broadcast": false,
+                "username": "attacker-controlled",
+                "icon_emoji": ":skull:",
+                "token": "xoxb-not-forwarded",
+                "endpoint": "https://attacker.invalid",
+                "unfurl_links": true,
+                "unfurl_media": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload,
+            json!({
+                "channel": "C123",
+                "ts": "1710000000.000100",
+                "text": "Heartbeat is healthy.",
+                "blocks": [{"type": "section"}],
+                "mrkdwn": true,
+            })
+        );
+    }
+
+    #[test]
+    fn python_slack_update_payload_requires_non_empty_fields() {
+        for (channel, ts, text, field) in [
+            ("", "1710000000.000100", "hello", "channel"),
+            ("   ", "1710000000.000100", "hello", "channel"),
+            ("C123", "", "hello", "ts"),
+            ("C123", "   ", "hello", "ts"),
+            ("C123", "1710000000.000100", "", "text"),
+            ("C123", "1710000000.000100", "   ", "text"),
+        ] {
+            let error = python_slack_update_payload(channel, ts, text, &json!({})).unwrap_err();
+            assert!(error.to_string().contains(&format!("non-empty {field}")));
+        }
+    }
+
+    #[test]
+    fn python_slack_update_result_is_stable_when_slack_omits_identifiers() {
+        let result = slack_update_result_from_response("C123", "1710000000.000100", json!({}));
+
+        assert_eq!(result.channel, "C123");
+        assert_eq!(result.ts, "1710000000.000100");
+    }
+
+    #[test]
+    fn slack_reconciliation_exact_match_returns_only_safe_identity_fields() {
+        let result = slack_reconciliation_match(
+            "C123",
+            "client-1",
+            None,
+            &json!([
+                {
+                    "channel": "C123",
+                    "client_msg_id": "wrong-id",
+                    "ts": "1710000000.000001",
+                    "text": "secret wrong message"
+                },
+                {
+                    "channel": "C123",
+                    "client_msg_id": "client-1",
+                    "ts": "1710000000.000100",
+                    "text": "secret message",
+                    "blocks": [{"type": "section", "text": {"text": "secret"}}],
+                    "metadata": {"event_type": "private"}
+                }
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            result,
+            json!({"found": true, "channel": "C123", "ts": "1710000000.000100"})
+        );
+        assert!(result.get("text").is_none());
+        assert!(result.get("blocks").is_none());
+        assert!(result.get("metadata").is_none());
+    }
+
+    #[test]
+    fn slack_reconciliation_rejects_wrong_channel_and_client_id() {
+        let result = slack_reconciliation_match(
+            "C123",
+            "client-1",
+            None,
+            &json!([
+                {
+                    "channel": "C999",
+                    "client_msg_id": "client-1",
+                    "ts": "1710000000.000100"
+                },
+                {
+                    "channel": "C123",
+                    "client_msg_id": "client-2",
+                    "ts": "1710000000.000101"
+                }
+            ]),
+        )
+        .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn slack_reconciliation_thread_lookup_isolated_from_other_threads() {
+        let messages = json!([
+            {
+                "channel": "C123",
+                "client_msg_id": "client-1",
+                "ts": "1710000000.000200",
+                "thread_ts": "1710000000.000999",
+                "text": "other thread secret"
+            },
+            {
+                "channel": "C123",
+                "client_msg_id": "client-1",
+                "ts": "1710000000.000201",
+                "thread_ts": "1710000000.000100",
+                "text": "requested thread secret"
+            }
+        ]);
+        let result =
+            slack_reconciliation_match("C123", "client-1", Some("1710000000.000100"), &messages)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            result,
+            json!({
+                "found": true,
+                "channel": "C123",
+                "ts": "1710000000.000201",
+                "thread_ts": "1710000000.000100"
+            })
+        );
+
+        assert!(
+            slack_reconciliation_match("C123", "client-1", Some("1710000000.000555"), &messages)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn slack_reconciliation_validates_malformed_inputs_and_pagination() {
+        for (field, value) in [
+            ("channel", json!("")),
+            ("channel", json!("C\n123")),
+            ("client_msg_id", json!("")),
+            ("client_msg_id", json!("client\u{0000}id")),
+        ] {
+            let mut request = json!({});
+            request[field] = value;
+            let error =
+                validate_slack_reconciliation_field(&request, field, "ctx.find_slack_message", 255)
+                    .unwrap_err();
+            assert!(error.to_string().contains(field));
+        }
+
+        assert!(validate_slack_reconciliation_thread_ts("not-a-slack-ts").is_err());
+        assert!(validate_slack_reconciliation_thread_ts("1710000000.000100").is_ok());
+        assert!(slack_reconciliation_match("C123", "client-1", None, &json!([null])).is_err());
+        assert!(
+            slack_reconciliation_next_cursor(&json!({
+                "has_more": true,
+                "response_metadata": {}
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            slack_reconciliation_next_cursor(&json!({
+                "has_more": true,
+                "response_metadata": {"next_cursor": "cursor-2"}
+            }))
+            .unwrap(),
+            Some("cursor-2".to_owned())
+        );
+    }
+
+    #[test]
+    fn slack_reconciliation_selects_only_the_scoped_official_endpoint() {
+        assert_eq!(
+            slack_reconciliation_endpoint(None),
+            "https://slack.com/api/conversations.history"
+        );
+        assert_eq!(
+            slack_reconciliation_endpoint(Some("1710000000.000100")),
+            "https://slack.com/api/conversations.replies"
+        );
+    }
+
+    #[test]
     fn parses_python_workflow_metric_notification() {
         let metric = parse_python_workflow_metric(&json!({
             "type": "ctx.metric",
@@ -5021,17 +6308,141 @@ mod tests {
 
     #[tokio::test]
     async fn ctx_call_tool_supports_builtin_time_now() {
-        let value = call_python_workflow_tool(&json!({
-            "type": "ctx.call_tool",
-            "tool": "time",
-            "method": "now",
-            "args": {},
-        }))
+        let value = call_python_workflow_tool(
+            "any-workflow",
+            &json!({
+                "type": "ctx.call_tool",
+                "tool": "time",
+                "method": "now",
+                "args": {},
+            }),
+        )
         .await
         .unwrap();
         assert_eq!(value["tool"], json!("time"));
         assert_eq!(value["method"], json!("now"));
         assert!(value.pointer("/output/utc").is_some());
+    }
+
+    #[test]
+    fn workflow_tool_allowlist_requires_exact_methods_and_scopes_by_workflow() {
+        let allowlist = parse_workflow_tool_allowlist(
+            r#"{
+                "daily_digest": {"slack": ["send_message"], "time": ["now"]},
+                "other_workflow": {"slack": ["read_message"]}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(workflow_tool_method_allowed(
+            Some(&allowlist),
+            "daily_digest",
+            "slack",
+            "send_message"
+        ));
+        assert!(!workflow_tool_method_allowed(
+            Some(&allowlist),
+            "daily_digest",
+            "slack",
+            "delete_message"
+        ));
+        assert!(!workflow_tool_method_allowed(
+            Some(&allowlist),
+            "other_workflow",
+            "slack",
+            "send_message"
+        ));
+        assert!(!workflow_tool_method_allowed(
+            Some(&allowlist),
+            "daily_digest",
+            "github",
+            "list"
+        ));
+    }
+
+    #[test]
+    fn workflow_tool_allowlist_preserves_unconfigured_workflow_compatibility() {
+        let allowlist = parse_workflow_tool_allowlist(r#"{"configured": {"slack": []}}"#).unwrap();
+
+        assert!(workflow_tool_method_allowed(
+            None,
+            "configured",
+            "slack",
+            "send_message"
+        ));
+        assert!(workflow_tool_method_allowed(
+            Some(&allowlist),
+            "unconfigured",
+            "slack",
+            "send_message"
+        ));
+    }
+
+    #[test]
+    fn workflow_tool_allowlist_rejects_malformed_configuration() {
+        for raw in [
+            "not-json",
+            "",
+            " ",
+            "[]",
+            r#"{"workflow": {"slack": "send_message"}}"#,
+            r#"{"workflow": {"slack": ["send_message", 1]}}"#,
+            r#"{" workflow": {"slack": ["send_message"]}}"#,
+            r#"{"workflow": {"slack ": ["send_message"]}}"#,
+            r#"{"workflow": {"slack": ["send_message "]}}"#,
+            r#"{"workflow\n": {"slack": ["send_message"]}}"#,
+            r#"{"workflow": {"slack": ["send\u0000message"]}}"#,
+        ] {
+            assert!(parse_workflow_tool_allowlist(raw).is_err(), "config: {raw}");
+        }
+        let overlong_workflow = format!(
+            r#"{{"{}": {{"slack": ["send_message"]}}}}"#,
+            "w".repeat(MAX_WORKFLOW_TOOL_IDENTIFIER_BYTES + 1)
+        );
+        let overlong_tool = format!(
+            r#"{{"workflow": {{"{}": ["send_message"]}}}}"#,
+            "t".repeat(MAX_WORKFLOW_TOOL_IDENTIFIER_BYTES + 1)
+        );
+        let overlong_method = format!(
+            r#"{{"workflow": {{"slack": ["{}"]}}}}"#,
+            "m".repeat(MAX_WORKFLOW_TOOL_IDENTIFIER_BYTES + 1)
+        );
+        for raw in [overlong_workflow, overlong_tool, overlong_method] {
+            assert!(
+                parse_workflow_tool_allowlist(&raw).is_err(),
+                "config: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_proxy_errors_are_bounded_and_do_not_include_request_or_response_data() {
+        let sensitive = [
+            "provider response body",
+            "bearer secret token",
+            "query text",
+            "request header",
+            "request payload",
+        ];
+        let errors = [
+            tool_proxy_transport_error(),
+            tool_proxy_http_error(reqwest::StatusCode::UNAUTHORIZED),
+            tool_proxy_json_error(reqwest::StatusCode::OK),
+        ];
+        for error in errors {
+            let rendered = error.to_string();
+            assert!(rendered.len() <= 128);
+            for value in sensitive {
+                assert!(
+                    !rendered.contains(value),
+                    "error leaked {value:?}: {rendered}"
+                );
+            }
+        }
+        assert_eq!(
+            tool_proxy_http_error(reqwest::StatusCode::UNAUTHORIZED).to_string(),
+            "ctx.call_tool proxy_http_error status=401"
+        );
     }
 
     #[test]
@@ -5069,6 +6480,14 @@ mod tests {
                     "workflow_name": "manual_workflow",
                     "source_path": "workflows/manual_workflow.py",
                     "principal": "finance-automation",
+                    "event_triggers": [{
+                        "workflow_name": "manual_workflow",
+                        "source_path": "workflows/manual_workflow.py",
+                        "spec": {
+                            "name": "manual-actions",
+                            "event_name_prefix": "slack.block_action.manual."
+                        }
+                    }],
                 },
             ],
         }))
@@ -5082,6 +6501,8 @@ mod tests {
             ])
         );
         assert_eq!(metadata.schedules.len(), 1);
+        assert_eq!(metadata.event_triggers.len(), 1);
+        assert_eq!(metadata.event_triggers[0].spec.name, "manual-actions");
         assert_eq!(
             metadata.schedules[0].get("workflow_name"),
             Some(&json!("scheduled_workflow"))
@@ -5116,6 +6537,50 @@ mod tests {
             Some(&WorkflowPrincipalDeclaration::Existing(
                 "prn_01k2m3n4p5".to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn event_trigger_registry_validates_names_and_enablement() {
+        let trigger = RegisteredWorkflowEventTrigger {
+            workflow_name: "heartbeat_feedback".to_owned(),
+            source_path: "workflows/heartbeat_feedback.py".to_owned(),
+            spec: WorkflowEventTriggerSpec {
+                name: "heartbeat-actions".to_owned(),
+                event_name_prefix: "slack.block_action.phai.heartbeat.".to_owned(),
+            },
+        };
+        let metadata = PythonWorkflowMetadata {
+            event_triggers: vec![trigger.clone()],
+            workflow_names: BTreeSet::from(["heartbeat_feedback".to_owned()]),
+            ..PythonWorkflowMetadata::default()
+        };
+
+        assert_eq!(
+            build_event_trigger_registry(&metadata, &WorkflowEnablement::all())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            build_event_trigger_registry(
+                &metadata,
+                &WorkflowEnablement::allowlist("other_workflow")
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let duplicate = PythonWorkflowMetadata {
+            event_triggers: vec![trigger.clone(), trigger],
+            ..PythonWorkflowMetadata::default()
+        };
+        let error = build_event_trigger_registry(&duplicate, &WorkflowEnablement::all())
+            .expect_err("duplicate event trigger names must fail discovery");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate workflow event trigger")
         );
     }
 

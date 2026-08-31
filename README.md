@@ -192,6 +192,18 @@ workflow host uses the generated `centaur-tools` bridge for that compatibility
 path. api-rs does not expose legacy HTTP tool-method routes as the current
 sandbox tool registry.
 
+The api-rs compatibility proxy can apply per-workflow method authorization with
+`WORKFLOW_TOOL_ALLOWLIST_JSON`, a JSON object mapping workflow names to tool
+names to exact allowed method arrays. Unset configuration preserves legacy
+behavior for workflows without a mapping; malformed (including a
+present-but-empty) configuration fails closed. Proxy failures are returned as
+bounded generic errors without provider response bodies or request details.
+
+The Phai production deployment must assert the exact configured entries for
+`heartbeat_run` and `heartbeat_feedback` (including their complete tool-method
+sets), and must reject missing, extra, or mismatched entries. A merely
+parseable or non-empty allowlist is not sufficient.
+
 ## Workflows
 
 Workflows are Python functions with durable steps.
@@ -206,6 +218,9 @@ async def handler(inp, ctx):
 ```
 
 Use workflows when a task should run longer than one request, wait for something external, run on a schedule, or coordinate multiple agent turns.
+Workflows may also declare idempotent internal-event triggers. Managed-principal
+workflows can use the typed heartbeat state API for recurring source review,
+human dispositions, and evidence-linked semantic-memory proposals.
 
 ## Security Model
 
@@ -214,6 +229,7 @@ Centaur is designed around practical isolation and auditability:
 - each conversation runs in a Kubernetes sandbox with a default-deny NetworkPolicy
 - sandboxes call approved local tool CLI shims and reach the outside world only through a per-sandbox [iron-proxy](https://docs.iron.sh)
 - sandboxes only ever see placeholder strings for upstream credentials; real values are swapped in by iron-proxy only on outbound requests to the specific hosts and headers a secret is bound to
+- sandboxed workflow hosts receive principal-scoped Postgres proxy DSNs and a non-secret database name, never the control plane's raw `DATABASE_URL`
 - messages, executions, events, and delivery state are persisted
 - outbound activity can be audited
 

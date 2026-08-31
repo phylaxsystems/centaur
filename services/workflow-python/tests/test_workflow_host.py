@@ -88,6 +88,15 @@ class RequestRpc(FakeRpc):
             }
         if message_type == "ctx.post_to_slack":
             return {"channel": payload["channel"], "ts": "1710000000.000100"}
+        if message_type == "ctx.update_slack":
+            return {"channel": payload["channel"], "ts": payload["ts"]}
+        if message_type == "ctx.find_slack_message":
+            return {
+                "found": True,
+                "channel": payload["channel"],
+                "ts": "1710000000.000100",
+                **({"thread_ts": payload["thread_ts"]} if "thread_ts" in payload else {}),
+            }
         if message_type == "ctx.sleep":
             return {"slept": True}
         if message_type == "ctx.event.wait":
@@ -470,6 +479,100 @@ class WorkflowHostTests(unittest.TestCase):
             ],
         )
 
+    def test_update_slack_sends_exact_rpc_payload(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+
+        result = asyncio.run(
+            ctx.update_slack(
+                "C12345678",
+                "1710000000.000100",
+                "Heartbeat is healthy.",
+                blocks=[{"type": "section"}],
+                mrkdwn=True,
+            )
+        )
+
+        self.assertEqual(result, {"channel": "C12345678", "ts": "1710000000.000100"})
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.update_slack",
+                    "channel": "C12345678",
+                    "ts": "1710000000.000100",
+                    "text": "Heartbeat is healthy.",
+                    "args": {"blocks": [{"type": "section"}], "mrkdwn": True},
+                }
+            ],
+        )
+
+    def test_find_slack_message_uses_bounded_metadata_only_rpc(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+
+        result = asyncio.run(
+            ctx.find_slack_message(
+                "C12345678",
+                "client-message-1",
+                thread_ts="1710000000.000100",
+            )
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "found": True,
+                "channel": "C12345678",
+                "ts": "1710000000.000100",
+                "thread_ts": "1710000000.000100",
+            },
+        )
+        self.assertEqual(
+            rpc.requests,
+            [
+                {
+                    "type": "ctx.find_slack_message",
+                    "channel": "C12345678",
+                    "client_msg_id": "client-message-1",
+                    "thread_ts": "1710000000.000100",
+                }
+            ],
+        )
+
+    def test_find_slack_message_omits_optional_thread_scope(self) -> None:
+        host = load_workflow_host()
+        rpc = RequestRpc()
+        ctx = host.WorkflowContext(
+            rpc,
+            run_id="run-123",
+            task_id="task-456",
+            workflow_name="sample",
+        )
+
+        asyncio.run(ctx.find_slack_message("C12345678", "client-message-1"))
+
+        self.assertEqual(
+            rpc.requests[-1],
+            {
+                "type": "ctx.find_slack_message",
+                "channel": "C12345678",
+                "client_msg_id": "client-message-1",
+            },
+        )
+
     def test_create_pool_retries_transient_connection_failure(self) -> None:
         host = load_workflow_host()
         calls = []
@@ -497,6 +600,87 @@ class WorkflowHostTests(unittest.TestCase):
         self.assertIs(result, pool)
         self.assertEqual(calls, ["postgresql://example/db"] * 3)
         self.assertEqual(sleeps, [0.25, 0.5])
+
+    def test_proxy_database_url_uses_explicit_database_without_raw_credentials(self) -> None:
+        host = load_workflow_host()
+
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "",
+                "CENTAUR_POSTGRES_DSN": "postgresql://proxy-user:proxy-pass@127.0.0.1:5432",
+                "WORKFLOW_HOST_DATABASE_NAME": "ai_v2",
+            },
+            clear=False,
+        ):
+            resolved = host.workflow_database_url()
+
+        self.assertEqual(
+            resolved,
+            ("postgresql://proxy-user:proxy-pass@127.0.0.1:5432/ai_v2", True),
+        )
+
+    def test_proxy_database_url_can_derive_database_from_legacy_direct_url(self) -> None:
+        host = load_workflow_host()
+
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "postgresql://raw-user:raw-pass@postgres/ai%5Fv2",
+                "CENTAUR_POSTGRES_DSN": "postgresql://proxy-user:proxy-pass@proxy:5432?sslmode=disable",
+                "WORKFLOW_HOST_DATABASE_NAME": "",
+            },
+            clear=False,
+        ):
+            resolved = host.workflow_database_url()
+
+        self.assertEqual(
+            resolved,
+            ("postgresql://proxy-user:proxy-pass@proxy:5432/ai_v2?sslmode=disable", True),
+        )
+
+    def test_proxy_database_url_fails_closed_without_database(self) -> None:
+        host = load_workflow_host()
+
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": "",
+                "CENTAUR_POSTGRES_DSN": "postgresql://proxy-user:proxy-pass@proxy:5432",
+                "WORKFLOW_HOST_DATABASE_NAME": "",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires WORKFLOW_HOST_DATABASE_NAME"):
+                host.workflow_database_url()
+
+    def test_create_pool_uses_proxy_safe_reset_callback(self) -> None:
+        host = load_workflow_host()
+        calls = []
+        pool = FakePool()
+
+        async def create_pool(database_url, **kwargs):
+            calls.append((database_url, kwargs))
+            return pool
+
+        fake_asyncpg = types.SimpleNamespace(create_pool=create_pool)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "DATABASE_URL": "",
+                    "CENTAUR_POSTGRES_DSN": "postgresql://proxy-user:proxy-pass@proxy:5432",
+                    "WORKFLOW_HOST_DATABASE_NAME": "ai_v2",
+                },
+                clear=False,
+            ),
+            patch.dict(sys.modules, {"asyncpg": fake_asyncpg}),
+        ):
+            result = asyncio.run(host.create_pool())
+
+        self.assertIs(result, pool)
+        self.assertEqual(calls[0][0], "postgresql://proxy-user:proxy-pass@proxy:5432/ai_v2")
+        self.assertIs(calls[0][1]["reset"], host._proxy_pool_reset)
 
     def test_workflow_result_includes_grouping_identifiers(self) -> None:
         host = load_workflow_host()
@@ -633,6 +817,10 @@ class WorkflowHostTests(unittest.TestCase):
 
         assert registered is not None
         self.assertEqual(host.normalize_principal(registered), True)
+        self.assertEqual(
+            host.workflow_principal_foreign_id(registered),
+            "workflow-principal-workflow",
+        )
 
     def test_load_workflow_file_reads_workflow_principal_reference(self) -> None:
         host = load_workflow_host()
@@ -648,6 +836,37 @@ class WorkflowHostTests(unittest.TestCase):
 
         assert registered is not None
         self.assertEqual(host.normalize_principal(registered), "finance-automation")
+        self.assertEqual(
+            host.workflow_principal_foreign_id(registered), "finance-automation"
+        )
+
+    def test_load_workflow_file_normalizes_event_triggers(self) -> None:
+        host = load_workflow_host()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "event_workflow.py"
+            path.write_text(
+                "WORKFLOW_NAME = 'event_workflow'\n"
+                "EVENT_TRIGGERS = [{'name': 'heartbeat-actions', "
+                "'event_name_prefix': 'slack.block_action.phai.heartbeat.'}]\n"
+                "def handler(inp, ctx):\n"
+                "    return None\n"
+            )
+            registered = host.load_workflow_file(path)
+
+        assert registered is not None
+        self.assertEqual(
+            host.normalize_event_triggers(registered),
+            [
+                {
+                    "workflow_name": "event_workflow",
+                    "source_path": str(path),
+                    "spec": {
+                        "name": "heartbeat-actions",
+                        "event_name_prefix": "slack.block_action.phai.heartbeat.",
+                    },
+                }
+            ],
+        )
 
         registered.principal = " prn_01k2m3n4p5 "
         self.assertEqual(host.normalize_principal(registered), "prn_01k2m3n4p5")

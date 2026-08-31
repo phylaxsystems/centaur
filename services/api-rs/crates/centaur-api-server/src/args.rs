@@ -4,6 +4,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::Command,
+    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -36,6 +37,7 @@ use centaur_session_runtime::{
 };
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
 use clap::{Args as ClapArgs, Parser, ValueEnum};
+use sqlx::postgres::PgConnectOptions;
 use tracing::{info, warn};
 
 use crate::{ServerError, activity_summary::ActivitySummaryConfig};
@@ -461,6 +463,23 @@ impl IronControlArgs {
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn workflow_database_name(database_url: &str) -> Result<String, ServerError> {
+    PgConnectOptions::from_str(database_url)
+        .map_err(|error| {
+            ServerError::UnsupportedConfig(format!(
+                "workflow host DATABASE_URL is not a valid PostgreSQL URL: {error}"
+            ))
+        })?
+        .get_database()
+        .and_then(|database| non_empty(Some(database)))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            ServerError::UnsupportedConfig(
+                "workflow host DATABASE_URL must select a database".to_owned(),
+            )
+        })
 }
 
 #[derive(Debug, ClapArgs)]
@@ -894,7 +913,13 @@ impl SandboxArgs {
         if let Ok(value) =
             env::var("WORKFLOW_HOST_DATABASE_URL").or_else(|_| env::var("DATABASE_URL"))
         {
-            spec = spec.env("DATABASE_URL", value);
+            spec = match self.backend {
+                SandboxBackendKind::Local => spec.env("DATABASE_URL", value),
+                SandboxBackendKind::AgentK8s => spec.env(
+                    "WORKFLOW_HOST_DATABASE_NAME",
+                    workflow_database_name(&value)?,
+                ),
+            };
         }
         for name in [
             "WORKFLOW_DIRS",
@@ -1255,6 +1280,10 @@ impl SandboxArgs {
 
     fn workflow_host_env_template(&self) -> Result<Vec<(String, String)>, ServerError> {
         let mut envs = vec![("CENTAUR_API_URL".to_owned(), self.centaur_api_url())];
+
+        if let Some(value) = clean_optional_value(env::var("OPENAI_BASE_URL").ok().as_deref()) {
+            envs.push(("OPENAI_BASE_URL".to_owned(), value));
+        }
 
         for (name, value) in self.iron_proxy.sandbox_placeholder_env()? {
             envs.push((name, value));
@@ -2645,6 +2674,67 @@ mod tests {
     }
 
     #[test]
+    fn agent_k8s_workflow_host_exposes_only_database_name() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[(
+            "WORKFLOW_HOST_DATABASE_URL",
+            "postgresql://raw-user:raw-pass@postgres/ai_v2",
+        )]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgresql://control:control@postgres/ai_v2",
+            "--session-sandbox-backend",
+            "agent-k8s",
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec("prn_test").unwrap();
+
+        assert!(!spec.env.iter().any(|env| env.name == "DATABASE_URL"));
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "WORKFLOW_HOST_DATABASE_NAME")
+                .map(|env| env.value.as_str()),
+            Some("ai_v2")
+        );
+    }
+
+    #[test]
+    fn local_workflow_host_keeps_direct_database_url() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[(
+            "WORKFLOW_HOST_DATABASE_URL",
+            "postgresql://local-user:local-pass@localhost/ai_v2",
+        )]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgresql://control:control@localhost/ai_v2",
+            "--session-sandbox-backend",
+            "local",
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec("prn_test").unwrap();
+
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "DATABASE_URL")
+                .map(|env| env.value.as_str()),
+            Some("postgresql://local-user:local-pass@localhost/ai_v2")
+        );
+        assert!(
+            !spec
+                .env
+                .iter()
+                .any(|env| env.name == "WORKFLOW_HOST_DATABASE_NAME")
+        );
+    }
+
+    #[test]
     fn workflow_host_env_template_splits_passthrough_env_from_environment() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[
@@ -2654,6 +2744,7 @@ mod tests {
             ),
             ("SLACK_ETL_ENABLED", "true"),
             ("SLACK_BACKFILL_ENABLED", "true"),
+            ("OPENAI_BASE_URL", "https://openai.example.test/v1"),
         ]);
         let args = Args::try_parse_from([
             "centaur-api-server",
@@ -2681,6 +2772,13 @@ mod tests {
                 .find(|env| env.name == "SLACK_ETL_ENABLED")
                 .map(|env| env.value.as_str()),
             Some("true")
+        );
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "OPENAI_BASE_URL")
+                .map(|env| env.value.as_str()),
+            Some("https://openai.example.test/v1")
         );
         assert_eq!(
             spec.env

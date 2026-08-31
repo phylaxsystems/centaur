@@ -6,6 +6,7 @@ import inspect
 from typing import Any
 
 from api.app import WorkflowToolManager, WorkflowTools, bind_context_rpc, reset_context_rpc
+from api.heartbeat import HeartbeatState
 
 
 @dataclasses.dataclass
@@ -26,6 +27,7 @@ class WorkflowContext:
         workflow_name: str,
         pool: Any = None,
         agent_defaults: dict[str, Any] | None = None,
+        workflow_principal: str | None = None,
     ) -> None:
         self._rpc = rpc
         self.run_id = run_id
@@ -37,6 +39,13 @@ class WorkflowContext:
         # per-call kwargs always win. See agent_turn().
         self._agent_defaults = dict(agent_defaults or {})
         self.tools = WorkflowTools(WorkflowToolManager(self._rpc))
+        self.heartbeat = HeartbeatState(
+            pool,
+            workflow_name=workflow_name,
+            workflow_run_id=run_id,
+            workflow_task_id=task_id,
+            workflow_principal=workflow_principal,
+        )
 
     def log(self, event: str, **fields: Any) -> None:
         self._rpc.notify(
@@ -191,6 +200,36 @@ class WorkflowContext:
                 "args": kwargs,
             }
         )
+
+    async def update_slack(self, channel: str, ts: str, text: str, **kwargs: Any) -> Any:
+        """Update a message previously posted by this workflow's Slack app."""
+        return await self._rpc.request(
+            {
+                "type": "ctx.update_slack",
+                "channel": channel,
+                "ts": ts,
+                "text": text,
+                "args": kwargs,
+            }
+        )
+
+    async def find_slack_message(
+        self, channel: str, client_msg_id: str, thread_ts: str | None = None
+    ) -> dict[str, Any]:
+        """Reconcile one of this workflow's Slack posts without reading content.
+
+        The workflow host performs a bounded exact ``client_msg_id`` lookup in
+        the requested channel, or in the requested thread when ``thread_ts``
+        is supplied.  The response contains only message identity fields.
+        """
+        request: dict[str, Any] = {
+            "type": "ctx.find_slack_message",
+            "channel": channel,
+            "client_msg_id": client_msg_id,
+        }
+        if thread_ts is not None:
+            request["thread_ts"] = thread_ts
+        return await self._rpc.request(request)
 
 
 def duration_seconds(value: dt.timedelta | int | float) -> float:

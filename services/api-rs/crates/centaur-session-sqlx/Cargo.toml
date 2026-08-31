@@ -9,13 +9,15 @@ repository.workspace = true
 centaur-session-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shell-words.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true
