@@ -704,6 +704,7 @@ class HeartbeatState:
                        'title', o.title,
                        'source_url', o.source_url,
                        'payload', o.normalized_payload,
+                       'sensitivity', o.sensitivity,
                        'relation', o.relation
                    ) order by o.captured_at desc) filter (where o.observation_id is not null), '[]'::jsonb) observations
             from heartbeat_items i
@@ -726,6 +727,89 @@ class HeartbeatState:
             limit,
         )
         return [_row(row) or {} for row in rows]
+
+    async def list_previous_runs(
+        self, *, profile_id: str, limit: int = 3
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, privacy-safe history for the current run.
+
+        History is deliberately limited to completed or partial runs for the
+        same profile and executor principal.  The response contains only run
+        metadata and items that were surfaced in that run.  Item summaries use
+        the current disposition, while an item is omitted if any of its linked
+        observations is not public or internal.  Artifacts, deliveries,
+        errors, source payloads, and memory facts are never selected.
+        """
+        self._require_ready()
+        if self.workflow_name != "heartbeat_run":
+            raise PermissionError(
+                "previous run history requires the heartbeat run workflow"
+            )
+        profile_uuid = _parse_uuid(profile_id, "profile_id")
+        await self._require_profile_executor(profile_uuid)
+        current_run_uuid = _parse_uuid(self.workflow_run_id, "workflow_run_id")
+        await self._require_run_executor(current_run_uuid, profile_uuid)
+        limit = max(1, min(int(limit), 8))
+        rows = await self._pool.fetch(
+            """
+            select r.run_id::text as run_id, r.trigger, r.status, r.outcome,
+                   r.candidate_count, r.surfaced_count, r.memory_proposal_count,
+                   r.started_at, r.completed_at,
+                   coalesce((
+                       select jsonb_agg(
+                           jsonb_build_object(
+                               'item_id', i.item_id,
+                               'story_key', left(i.story_key, 256),
+                               'item_type', left(i.item_type, 64),
+                               'title', left(i.title, 512),
+                               'summary', left(i.summary, 2000),
+                               'status', i.status,
+                               'disposition', i.disposition,
+                               'priority_tier', i.priority_tier,
+                               'due_at', i.due_at
+                           )
+                           order by i.priority_tier, i.last_changed_at desc, i.item_id
+                       )
+                       from heartbeat_items i
+                       where i.profile_id = r.profile_id
+                         and exists (
+                             select 1 from heartbeat_item_events e
+                             where e.item_id = i.item_id
+                               and e.run_id = r.run_id
+                               and e.event_type = 'surfaced'
+                         )
+                         and exists (
+                             select 1 from heartbeat_item_observations io
+                             where io.item_id = i.item_id
+                         )
+                         and not exists (
+                             select 1
+                             from heartbeat_item_observations io
+                             join heartbeat_observations o
+                               on o.observation_id = io.observation_id
+                             where io.item_id = i.item_id
+                               and (o.profile_id <> r.profile_id
+                                    or o.sensitivity not in ('public', 'internal'))
+                         )
+                   ), '[]'::jsonb) as items
+              from heartbeat_runs r
+             where r.profile_id = $1
+               and r.executor_principal_foreign_id = $3
+               and r.run_id <> $2
+               and r.status in ('completed', 'partial')
+             order by r.completed_at desc nulls last, r.run_id desc
+             limit $4
+            """,
+            profile_uuid,
+            current_run_uuid,
+            self.workflow_principal,
+            limit,
+        )
+        return [_row(row) or {} for row in rows]
+
+    async def retrieve_previous_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Compatibility alias for callers that use retrieve-style facades."""
+        return await self.list_previous_runs(**kwargs)
 
     async def put_artifact(
         self,

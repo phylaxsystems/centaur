@@ -431,6 +431,7 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
         candidates = await first.list_candidates(profile_id=str(profile["profile_id"]))
         self.assertEqual(len(candidates), 1)
         self.assertTrue(candidates[0]["changed_in_run"])
+        self.assertEqual(candidates[0]["observations"][0]["sensitivity"], "internal")
         evidence_id = str(candidates[0]["observations"][0]["observation_id"])
         synthesized = {
             "item_id": str(candidates[0]["item_id"]),
@@ -1432,6 +1433,250 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
                 )
         finally:
             await admin.close()
+
+    async def test_z_previous_runs_are_bounded_ordered_and_privacy_safe(self) -> None:
+        profile_name = f"previous-runs-{uuid.uuid4().hex[:12]}"
+        state = self.state(run_id=uuid.uuid4())
+        profile = await state.register_profile(
+            {
+                "namespace": "default",
+                "name": profile_name,
+                "scope_kind": "organization",
+                "scope_ref": "engineering",
+                "definition_hash": "previous-runs-v1",
+                "definition_version": 1,
+                "destination": {"kind": "slack", "ref": "C-previous-runs"},
+                "required_sources": ["linear"],
+                "optional_sources": [],
+                "delivery_policy": {"posture": "read_and_draft_only"},
+                "reviewer_refs": [],
+                "enabled": True,
+            }
+        )
+        other_profile = await state.register_profile(
+            {
+                "namespace": "default",
+                "name": f"{profile_name}-other",
+                "scope_kind": "organization",
+                "scope_ref": "engineering-other",
+                "definition_hash": "previous-runs-v1",
+                "definition_version": 1,
+                "destination": {"kind": "slack", "ref": "C-previous-runs-other"},
+                "required_sources": [],
+                "optional_sources": [],
+                "delivery_policy": {"posture": "read_and_draft_only"},
+                "reviewer_refs": [],
+                "enabled": True,
+            }
+        )
+        current = await state.begin_run(
+            profile_id=str(profile["profile_id"]),
+            trigger="manual",
+            definition_hash="previous-runs-v1",
+            prompt_version="previous-runs-test",
+        )
+        prior_run_ids: list[uuid.UUID] = []
+        newest_item_id: uuid.UUID | None = None
+        try:
+            for index in range(10):
+                run_id = uuid.uuid4()
+                prior = self.state(run_id=run_id)
+                await prior.begin_run(
+                    profile_id=str(profile["profile_id"]),
+                    trigger="schedule",
+                    definition_hash="previous-runs-v1",
+                    prompt_version="previous-runs-test",
+                )
+                prior_run_ids.append(run_id)
+                item_id = uuid.uuid4()
+                observation_id = uuid.uuid4()
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_observations (
+                        observation_id, profile_id, run_id, source_key,
+                        source_object_id, source_revision, content_hash, title,
+                        source_url, normalized_payload, sensitivity
+                    ) values ($1, $2, $3, 'linear', $4, 'v1', $5, $6, $7,
+                              $8::jsonb, 'public')
+                    """,
+                    observation_id,
+                    profile["profile_id"],
+                    run_id,
+                    f"ENG-{index}",
+                    f"hash-{index}",
+                    f"Compile observation {index}",
+                    "https://example.invalid/engineering",
+                    json.dumps({"provider_payload": "must not be returned"}),
+                )
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_items (
+                        item_id, profile_id, story_key, item_type, title, summary,
+                        material_hash, priority_tier
+                    ) values ($1, $2, $3, 'work', $4, $5, $6, 1)
+                    """,
+                    item_id,
+                    profile["profile_id"],
+                    f"engineering:compile-{index}",
+                    f"Rust compile time {index}",
+                    "Consider shared compilation caching.",
+                    f"hash-{index}",
+                )
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_item_observations (
+                        item_id, observation_id, relation, linked_by
+                    ) values ($1, $2, 'primary', 'deterministic')
+                    """,
+                    item_id,
+                    observation_id,
+                )
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_item_events (
+                        event_id, item_id, run_id, event_type, from_status,
+                        to_status, item_version, actor_kind, actor_ref,
+                        payload, idempotency_key
+                    ) values ($1, $2, $3, 'surfaced', 'open', 'open', 1,
+                              'system', 'test', '{"token":"secret"}'::jsonb, $4)
+                    """,
+                    uuid.uuid4(),
+                    item_id,
+                    run_id,
+                    f"previous-runs-surfaced-{run_id}",
+                )
+                if index == 9:
+                    newest_item_id = item_id
+                await prior.complete_run(
+                    run_id=str(run_id),
+                    status="partial" if index == 0 else "completed",
+                    outcome="attention",
+                )
+                await self.pool.execute(
+                    """
+                    update heartbeat_runs
+                       set completed_at = now() - ($2::integer * interval '1 second')
+                     where run_id = $1
+                    """,
+                    run_id,
+                    100 - index,
+                )
+
+            assert newest_item_id is not None
+            await self.pool.execute(
+                """
+                update heartbeat_items
+                   set status = 'resolved', disposition = 'park'
+                 where item_id = $1
+                """,
+                newest_item_id,
+            )
+
+            # The newest run has one confidentially-linked item.  The run must
+            # remain visible, but that item must be omitted from its projection.
+            sensitive_item_id = uuid.uuid4()
+            sensitive_observation_id = uuid.uuid4()
+            newest_run_id = prior_run_ids[-1]
+            await self.pool.execute(
+                """
+                insert into heartbeat_observations (
+                    observation_id, profile_id, run_id, source_key,
+                    source_object_id, source_revision, content_hash, title,
+                    source_url, normalized_payload, sensitivity
+                ) values ($1, $2, $3, 'linear', 'ENG-CONFIDENTIAL', 'v1',
+                          'confidential-hash', 'Private provider payload',
+                          'https://example.invalid/private', '{"secret":"no"}'::jsonb,
+                          'confidential')
+                """,
+                sensitive_observation_id,
+                profile["profile_id"],
+                newest_run_id,
+            )
+            await self.pool.execute(
+                """
+                insert into heartbeat_items (
+                    item_id, profile_id, story_key, item_type, title, summary,
+                    material_hash, priority_tier
+                ) values ($1, $2, 'engineering:private', 'work',
+                          'Private item must not surface', 'private summary',
+                          'confidential-hash', 1)
+                """,
+                sensitive_item_id,
+                profile["profile_id"],
+            )
+            await self.pool.execute(
+                """
+                insert into heartbeat_item_observations (
+                    item_id, observation_id, relation, linked_by
+                ) values ($1, $2, 'primary', 'deterministic')
+                """,
+                sensitive_item_id,
+                sensitive_observation_id,
+            )
+            await self.pool.execute(
+                """
+                insert into heartbeat_item_events (
+                    event_id, item_id, run_id, event_type, from_status,
+                    to_status, item_version, actor_kind, actor_ref,
+                    payload, idempotency_key
+                ) values ($1, $2, $3, 'surfaced', 'open', 'open', 1,
+                          'system', 'test', '{}'::jsonb, $4)
+                """,
+                uuid.uuid4(),
+                sensitive_item_id,
+                newest_run_id,
+                f"previous-runs-sensitive-{newest_run_id}",
+            )
+
+            history = await state.list_previous_runs(
+                profile_id=str(profile["profile_id"]), limit=99
+            )
+            self.assertEqual(len(history), 8)
+            self.assertEqual(
+                [row["run_id"] for row in history],
+                [str(run_id) for run_id in reversed(prior_run_ids[-8:])],
+            )
+            self.assertNotIn(str(current["run_id"]), {row["run_id"] for row in history})
+            self.assertEqual(history[0]["status"], "completed")
+            self.assertEqual(history[0]["items"][0]["status"], "resolved")
+            self.assertEqual(history[0]["items"][0]["disposition"], "park")
+            self.assertEqual(len(history[0]["items"]), 1)
+            self.assertNotIn("Private item must not surface", str(history[0]))
+            self.assertNotIn("provider_payload", str(history[0]))
+            self.assertNotIn("secret", str(history[0]))
+            self.assertEqual(
+                set(history[0]),
+                {
+                    "run_id",
+                    "trigger",
+                    "status",
+                    "outcome",
+                    "candidate_count",
+                    "surfaced_count",
+                    "memory_proposal_count",
+                    "started_at",
+                    "completed_at",
+                    "items",
+                },
+            )
+
+            with self.assertRaises(PermissionError):
+                await state.list_previous_runs(
+                    profile_id=str(other_profile["profile_id"])
+                )
+            with self.assertRaises(PermissionError):
+                await self.state(
+                    run_id=uuid.uuid4(), principal="workflow-heartbeat-other"
+                ).list_previous_runs(profile_id=str(profile["profile_id"]))
+        finally:
+            admin_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=1)
+            try:
+                await admin_pool.execute(
+                    "delete from heartbeat_profiles where profile_id = any($1::uuid[])",
+                    [profile["profile_id"], other_profile["profile_id"]],
+                )
+            finally:
+                admin_pool.terminate()
 
     async def test_zz_memory_event_idempotency_is_namespaced_by_fact(self) -> None:
         state = self.state(run_id=uuid.uuid4())
