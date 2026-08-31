@@ -1886,17 +1886,21 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
                 window_end=end,
             )
 
-        await self.pool.execute(
-            """
-            insert into heartbeat_execution_metric_buckets (
-                organization_scope, persona_key, language, command_family,
-                bucket_start, duration_bucket_ms, status, sample_count,
-                total_duration_ms
-            ) values ($1, 'eng', 'rust', 'cargo_build',
-                      date_trunc('hour', (now() - interval '91 days') at time zone 'UTC') at time zone 'UTC', 100, 'completed', 3, 300)
-            """,
-            scope,
-        )
+        admin = await asyncpg.connect(DATABASE_URL)
+        try:
+            await admin.execute(
+                """
+                insert into heartbeat_execution_metric_buckets (
+                    organization_scope, persona_key, language, command_family,
+                    bucket_start, duration_bucket_ms, status, sample_count,
+                    total_duration_ms
+                ) values ($1, 'eng', 'rust', 'cargo_build',
+                          date_trunc('hour', (now() - interval '91 days') at time zone 'UTC') at time zone 'UTC', 100, 'completed', 3, 300)
+                """,
+                scope,
+            )
+        finally:
+            await admin.close()
         retention = await state.apply_execution_metric_retention(
             str(profile["profile_id"])
         )
