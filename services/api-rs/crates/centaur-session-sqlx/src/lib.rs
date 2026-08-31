@@ -2193,6 +2193,8 @@ async fn record_execution_metric<'a>(
         return Ok(());
     };
 
+    // Pairing is intentionally bounded: raw event history is only inspected
+    // transiently, across the newest 1,000 events for this execution.
     let event_rows = sqlx::query_as::<_, MetricEventPayloadRow>(
         r#"
         select payload
@@ -2227,7 +2229,6 @@ async fn record_execution_metric<'a>(
             && event.item_id == completed.item_id
         {
             started = Some(event);
-            break;
         }
     }
     let Some(started) = started else {
@@ -3123,7 +3124,7 @@ mod tests {
                 "unknown_future_key": "must not persist"
             }
         });
-        for event in [&started, &completed, &completed] {
+        for event in [&started, &completed, &started, &completed] {
             store
                 .append_event_if_stdout_owner(
                     &thread_key,
