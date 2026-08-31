@@ -647,6 +647,9 @@ linearbot:
     tag: latest
     pullPolicy: Always
   userName: centaur
+  # Optional model override for synthesized issue assignment/delegation turns.
+  # Comment mentions continue to use their explicit or deployment default model.
+  assignmentModel: ""
   extraEnv: {}
   resources: {}
 

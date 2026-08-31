@@ -89,6 +89,8 @@ export type LinearbotFetch = (
 export type LinearbotOptions = {
   apiKey?: string;
   apiUrl: string;
+  /** Model used only for synthesized issue assignment/delegation turns. */
+  assignmentModel?: string;
   /**
    * Connect the Postgres state (and initialize the adapter) at startup.
    * Defaults to true; tests pass false to skip the live connect against mock

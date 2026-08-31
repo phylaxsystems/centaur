@@ -556,6 +556,43 @@ describe("linearbot comment-thread pipeline", () => {
     ).toBe(true);
   });
 
+  it("uses the configured assignment model only for issue assignment turns", async () => {
+    bot = createTestBot({ assignmentModel: "gpt-5.6-luna" });
+
+    const assignmentThreadKey = `linear:${ISSUE_ID}`;
+    await postWebhook(
+      issueAssignmentPayload({ updatedAt: "2026-06-16T00:30:00.000Z" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === assignmentThreadKey),
+    );
+    const assignmentExecute = codexApi.executes.find(
+      (e) => e.threadKey === assignmentThreadKey,
+    )!;
+    const assignmentInput = JSON.parse(
+      assignmentExecute.body.input_lines[0]!,
+    ) as { model?: string };
+    expect(assignmentInput.model).toBe("gpt-5.6-luna");
+
+    const commentThreadKey = `linear:${ISSUE_ID}:c:comment-default-model`;
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-default-model",
+        body: "@centaur check the assignment",
+      }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === commentThreadKey),
+    );
+    const commentExecute = codexApi.executes.find(
+      (e) => e.threadKey === commentThreadKey,
+    )!;
+    const commentInput = JSON.parse(commentExecute.body.input_lines[0]!) as {
+      model?: string;
+    };
+    expect("model" in commentInput).toBe(false);
+  });
+
   it("posts a 'starting work' comment up front on assignment, then swaps it to the answer", async () => {
     const threadKey = `linear:${ISSUE_ID}`;
     await postWebhook(

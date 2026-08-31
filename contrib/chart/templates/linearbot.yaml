@@ -36,6 +36,10 @@ spec:
             # the deployment's default harness.
             - name: LINEARBOT_DEFAULT_HARNESS
               value: {{ .Values.sandbox.harnessEngine | quote }}
+{{- with .Values.linearbot.assignmentModel }}
+            - name: LINEARBOT_ASSIGNMENT_MODEL
+              value: {{ . | quote }}
+{{- end }}
             # actor=app OAuth token from the Linear agent install; agent
             # sessions are unavailable on a plain personal API key.
             - name: LINEAR_ACCESS_TOKEN

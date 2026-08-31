@@ -34,7 +34,8 @@ control plane is unchanged (`linear:…` thread keys flow through identically).
   unrelated edits — labels, descriptions, the bot's own status write bouncing back — don't re-run
   it). The turn posts an "On it" comment immediately (no triggering comment to react to) and runs a
   synthesized "work this issue to the best of your ability" instruction (a bare handoff carries no
-  user prompt).
+  user prompt). Deployments can select a model for these synthesized assignment turns without
+  changing comment mentions by setting `LINEARBOT_ASSIGNMENT_MODEL`.
 - **Owned issues track progress via workflow status** (mentions never move status — the agent owns
   only issues *assigned/delegated* to it): kicking off an assignment turn moves Todo/Backlog/Triage
   → the team's first started state; at the end the agent either moves the issue itself with the
@@ -101,6 +102,7 @@ mentionable and assignable in the first place, not an agent-session add-on.
 | `CENTAUR_API_URL` | — | api-rs control plane, default `http://127.0.0.1:8080`. |
 | `LINEARBOT_API_KEY` | — | Dedicated bearer sent to api-rs. |
 | `LINEARBOT_USER_NAME` | — | Bot display name for mention parsing, default `centaur` (the bot also derives its real handle/name from its own token). |
+| `LINEARBOT_ASSIGNMENT_MODEL` | — | Per-turn model override for synthesized issue assignment/delegation work only; comment mentions keep their existing default or explicit inline override. |
 | `LINEARBOT_LOG_LEVEL` | — | `debug`/`info`/`warn`/`error`, default `info`. |
 | `SESSION_IDLE_TIMEOUT_MS` / `SESSION_MAX_DURATION_MS` | — | Forwarded to api-rs executes. |
 

@@ -697,7 +697,7 @@ function handleIssueAssignment(
         executeMessage: assignmentInstructionMessage(event, threadKey),
         issueId: event.issueId,
         options,
-        overrides: {},
+        overrides: { model: options.assignmentModel },
         thread,
         threadKey,
         trace,
