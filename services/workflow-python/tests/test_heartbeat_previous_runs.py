@@ -42,7 +42,6 @@ class FakePool:
                 "items": [
                     {
                         "item_id": uuid.uuid4(),
-                        "story_key": "engineering:compile-time",
                         "item_type": "work",
                         "title": "Rust builds are slow",
                         "summary": "Consider shared compilation caching.",
@@ -103,7 +102,6 @@ class PreviousRunsTests(unittest.IsolatedAsyncioTestCase):
             set(result[0]["items"][0]),
             {
                 "item_id",
-                "story_key",
                 "item_type",
                 "title",
                 "summary",
@@ -118,6 +116,9 @@ class PreviousRunsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("r.run_id <> $2", query)
         self.assertIn("r.status in ('completed', 'partial')", query)
         self.assertIn("o.sensitivity not in ('public', 'internal')", query)
+        self.assertIn("limit 25", query)
+        self.assertIn("from (", query)
+        self.assertNotIn("story_key", query)
         for forbidden in (
             "heartbeat_run_artifacts",
             "heartbeat_deliveries",

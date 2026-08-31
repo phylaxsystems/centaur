@@ -735,8 +735,10 @@ class HeartbeatState:
 
         History is deliberately limited to completed or partial runs for the
         same profile and executor principal.  The response contains only run
-        metadata and items that were surfaced in that run.  Item summaries use
-        the current disposition, while an item is omitted if any of its linked
+        metadata and at most 25 items that were surfaced in that run.  Item
+        title, summary, status, and disposition are current item state
+        associated with a historical surfaced event, not a byte-exact
+        historical Slack snapshot.  An item is omitted if any of its linked
         observations is not public or internal.  Artifacts, deliveries,
         errors, source payloads, and memory facts are never selected.
         """
@@ -759,10 +761,9 @@ class HeartbeatState:
                        select jsonb_agg(
                            jsonb_build_object(
                                'item_id', i.item_id,
-                               'story_key', left(i.story_key, 256),
                                'item_type', left(i.item_type, 64),
                                'title', left(i.title, 512),
-                               'summary', left(i.summary, 2000),
+                               'summary', left(i.summary, 1000),
                                'status', i.status,
                                'disposition', i.disposition,
                                'priority_tier', i.priority_tier,
@@ -770,27 +771,32 @@ class HeartbeatState:
                            )
                            order by i.priority_tier, i.last_changed_at desc, i.item_id
                        )
-                       from heartbeat_items i
-                       where i.profile_id = r.profile_id
-                         and exists (
-                             select 1 from heartbeat_item_events e
-                             where e.item_id = i.item_id
-                               and e.run_id = r.run_id
-                               and e.event_type = 'surfaced'
-                         )
-                         and exists (
-                             select 1 from heartbeat_item_observations io
-                             where io.item_id = i.item_id
-                         )
-                         and not exists (
-                             select 1
-                             from heartbeat_item_observations io
-                             join heartbeat_observations o
-                               on o.observation_id = io.observation_id
-                             where io.item_id = i.item_id
-                               and (o.profile_id <> r.profile_id
-                                    or o.sensitivity not in ('public', 'internal'))
-                         )
+                       from (
+                           select i.*
+                           from heartbeat_items i
+                           where i.profile_id = r.profile_id
+                             and exists (
+                                 select 1 from heartbeat_item_events e
+                                 where e.item_id = i.item_id
+                                   and e.run_id = r.run_id
+                                   and e.event_type = 'surfaced'
+                             )
+                             and exists (
+                                 select 1 from heartbeat_item_observations io
+                                 where io.item_id = i.item_id
+                             )
+                             and not exists (
+                                 select 1
+                                 from heartbeat_item_observations io
+                                 join heartbeat_observations o
+                                   on o.observation_id = io.observation_id
+                                 where io.item_id = i.item_id
+                                   and (o.profile_id <> r.profile_id
+                                        or o.sensitivity not in ('public', 'internal'))
+                             )
+                           order by i.priority_tier, i.last_changed_at desc, i.item_id
+                           limit 25
+                       ) i
                    ), '[]'::jsonb) as items
               from heartbeat_runs r
              where r.profile_id = $1

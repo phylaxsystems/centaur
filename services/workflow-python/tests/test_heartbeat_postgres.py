@@ -1628,6 +1628,80 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
                 f"previous-runs-sensitive-{newest_run_id}",
             )
 
+            # Add more than the projection bound to prove the database query
+            # limits before aggregation rather than truncating after retrieval.
+            for extra_index in range(26):
+                extra_item_id = uuid.uuid4()
+                extra_observation_id = uuid.uuid4()
+                extra_hash = f"extra-hash-{extra_index}"
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_observations (
+                        observation_id, profile_id, run_id, source_key,
+                        source_object_id, source_revision, content_hash, title,
+                        source_url, normalized_payload, sensitivity
+                    ) values ($1, $2, $3, 'linear', $4, 'v1', $5, $6, $7,
+                              $8::jsonb, 'public')
+                    """,
+                    extra_observation_id,
+                    profile["profile_id"],
+                    newest_run_id,
+                    f"ENG-EXTRA-{extra_index}",
+                    extra_hash,
+                    f"Extra compile observation {extra_index}",
+                    "https://example.invalid/engineering",
+                    json.dumps({"provider_payload": "must not be returned"}),
+                )
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_items (
+                        item_id, profile_id, story_key, item_type, title, summary,
+                        material_hash, priority_tier
+                    ) values ($1, $2, $3, 'work', $4, $5, $6, 1)
+                    """,
+                    extra_item_id,
+                    profile["profile_id"],
+                    f"engineering:extra-{extra_index}",
+                    f"Extra Rust compile item {extra_index}",
+                    "Extra continuity summary.",
+                    extra_hash,
+                )
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_item_observations (
+                        item_id, observation_id, relation, linked_by
+                    ) values ($1, $2, 'primary', 'deterministic')
+                    """,
+                    extra_item_id,
+                    extra_observation_id,
+                )
+                await self.pool.execute(
+                    """
+                    insert into heartbeat_item_events (
+                        event_id, item_id, run_id, event_type, from_status,
+                        to_status, item_version, actor_kind, actor_ref,
+                        payload, idempotency_key
+                    ) values ($1, $2, $3, 'surfaced', 'open', 'open', 1,
+                              'system', 'test', '{}'::jsonb, $4)
+                    """,
+                    uuid.uuid4(),
+                    extra_item_id,
+                    newest_run_id,
+                    f"previous-runs-extra-{newest_run_id}-{extra_index}",
+                )
+
+            await self.pool.execute(
+                """
+                update heartbeat_items
+                   set title = 'Current title ' || repeat('T', 700),
+                       summary = 'Current summary ' || repeat('S', 1500),
+                       status = 'resolved', disposition = 'park',
+                       last_changed_at = now()
+                 where item_id = $1
+                """,
+                newest_item_id,
+            )
+
             history = await state.list_previous_runs(
                 profile_id=str(profile["profile_id"]), limit=99
             )
@@ -1638,9 +1712,20 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertNotIn(str(current["run_id"]), {row["run_id"] for row in history})
             self.assertEqual(history[0]["status"], "completed")
-            self.assertEqual(history[0]["items"][0]["status"], "resolved")
-            self.assertEqual(history[0]["items"][0]["disposition"], "park")
-            self.assertEqual(len(history[0]["items"]), 1)
+            self.assertEqual(len(history[0]["items"]), 25)
+            current_items = [
+                item
+                for item in history[0]["items"]
+                if item["item_id"] == str(newest_item_id)
+            ]
+            self.assertEqual(len(current_items), 1)
+            current_item = current_items[0]
+            self.assertEqual(current_item["status"], "resolved")
+            self.assertEqual(current_item["disposition"], "park")
+            self.assertEqual(len(current_item["title"]), 512)
+            self.assertTrue(current_item["title"].startswith("Current title "))
+            self.assertEqual(len(current_item["summary"]), 1000)
+            self.assertTrue(current_item["summary"].startswith("Current summary "))
             self.assertNotIn("Private item must not surface", str(history[0]))
             self.assertNotIn("provider_payload", str(history[0]))
             self.assertNotIn("secret", str(history[0]))
