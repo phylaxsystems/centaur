@@ -76,7 +76,7 @@ security definer
 set search_path = pg_catalog, public
 as $$
 declare
-    p record;
+    profile_row record;
 begin
     if heartbeat_current_workflow_principal() <> 'workflow-heartbeat-run' then
         raise exception 'execution metrics require the heartbeat run workflow'
@@ -97,7 +97,7 @@ begin
             using errcode = '22023';
     end if;
 
-    select * into p
+    select * into profile_row
      from public.heartbeat_profiles
      where profile_id = p_profile_id
        and scope_kind = 'organization'
@@ -114,7 +114,7 @@ begin
                m.command_family, m.status, m.duration_bucket_ms,
                m.sample_count, m.total_duration_ms
           from public.heartbeat_execution_metric_buckets m
-         where m.organization_scope = p.scope_ref
+         where m.organization_scope = profile_row.scope_ref
            and m.bucket_start >= p_window_start
            and m.bucket_start < p_window_end
     ), grouped as (
@@ -151,10 +151,11 @@ begin
     )
     select g.organization_scope, g.persona_key, g.language,
            g.command_family, g.status, g.sample_count, g.total_duration_ms,
-           p.p50_duration_bucket_ms, p.p95_duration_bucket_ms, true
+           percentile_row.p50_duration_bucket_ms,
+           percentile_row.p95_duration_bucket_ms, true
       from grouped g
-      join percentiles p using (organization_scope, persona_key, language,
-                                command_family, status)
+      join percentiles percentile_row using (organization_scope, persona_key, language,
+                                             command_family, status)
      order by g.total_duration_ms desc, g.command_family, g.persona_key,
               g.status
      limit p_limit;

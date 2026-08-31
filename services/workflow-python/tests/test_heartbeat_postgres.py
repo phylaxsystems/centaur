@@ -1783,6 +1783,23 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
+        async def cleanup() -> None:
+            admin = await asyncpg.connect(DATABASE_URL)
+            try:
+                await admin.execute(
+                    "delete from heartbeat_execution_metric_buckets where organization_scope in ($1, $2)",
+                    scope,
+                    other_scope,
+                )
+                await admin.execute(
+                    "delete from heartbeat_profiles where profile_id = $1",
+                    profile["profile_id"],
+                )
+            finally:
+                await admin.close()
+
+        self.addAsyncCleanup(cleanup)
+
         admin = await asyncpg.connect(DATABASE_URL)
         try:
             await admin.execute(
@@ -1806,6 +1823,8 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
         now = dt.datetime.now(dt.UTC).replace(minute=0, second=0, microsecond=0)
         start = now - dt.timedelta(hours=1)
         end = now + dt.timedelta(hours=1)
+        # The p50/p95 assertions exercise the SQL CTE projection directly;
+        # a profile-record/CTE alias collision raises before returning rows.
         rows = await state.aggregate_execution_metrics(
             profile_id=str(profile["profile_id"]),
             window_start=start,
@@ -1883,20 +1902,6 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(set(retention), {"execution_metric_buckets_deleted"})
         self.assertGreaterEqual(retention["execution_metric_buckets_deleted"], 1)
-
-        admin = await asyncpg.connect(DATABASE_URL)
-        try:
-            await admin.execute(
-                "delete from heartbeat_execution_metric_buckets where organization_scope in ($1, $2)",
-                scope,
-                other_scope,
-            )
-            await admin.execute(
-                "delete from heartbeat_profiles where profile_id = $1",
-                profile["profile_id"],
-            )
-        finally:
-            await admin.close()
 
     async def test_zz_memory_event_idempotency_is_namespaced_by_fact(self) -> None:
         state = self.state(run_id=uuid.uuid4())
