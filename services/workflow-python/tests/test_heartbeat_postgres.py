@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -44,6 +45,7 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
             "0062_heartbeat_draft_grant_replay.sql",
             "0063_heartbeat_synthesis_attempt_artifact.sql",
             "0064_heartbeat_memory_completion.sql",
+            "0065_heartbeat_execution_metrics.sql",
         ):
             if migration == "0064_heartbeat_memory_completion.sql":
                 await self.pool.execute(
@@ -1762,6 +1764,139 @@ class HeartbeatPostgresTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 admin_pool.terminate()
+
+    async def test_execution_metrics_are_bounded_suppressed_and_principal_scoped(
+        self,
+    ) -> None:
+        state = self.state(run_id=uuid.uuid4())
+        scope = f"metrics-{uuid.uuid4().hex[:12]}"
+        other_scope = f"other-metrics-{uuid.uuid4().hex[:12]}"
+        profile = await state.register_profile(
+            {
+                "namespace": "default",
+                "name": f"metrics-{uuid.uuid4().hex}",
+                "scope_kind": "organization",
+                "scope_ref": scope,
+                "definition_hash": "metrics-definition-v1",
+                "definition_version": 1,
+                "enabled": True,
+            }
+        )
+
+        admin = await asyncpg.connect(DATABASE_URL)
+        try:
+            await admin.execute(
+                """
+                insert into heartbeat_execution_metric_buckets (
+                    organization_scope, persona_key, language, command_family,
+                    bucket_start, duration_bucket_ms, status, sample_count,
+                    total_duration_ms
+                ) values
+                    ($1, 'eng', 'rust', 'cargo_build', date_trunc('hour', now() at time zone 'UTC') at time zone 'UTC', 100, 'completed', 2, 160),
+                    ($1, 'eng', 'rust', 'cargo_build', date_trunc('hour', now() at time zone 'UTC') at time zone 'UTC', 500, 'completed', 1, 420),
+                    ($1, 'eng', 'rust', 'cargo_test', date_trunc('hour', now() at time zone 'UTC') at time zone 'UTC', 100, 'completed', 2, 180),
+                    ($2, 'eng', 'rust', 'cargo_build', date_trunc('hour', now() at time zone 'UTC') at time zone 'UTC', 100, 'completed', 9, 900)
+                """,
+                scope,
+                other_scope,
+            )
+        finally:
+            await admin.close()
+
+        now = dt.datetime.now(dt.UTC).replace(minute=0, second=0, microsecond=0)
+        start = now - dt.timedelta(hours=1)
+        end = now + dt.timedelta(hours=1)
+        rows = await state.aggregate_execution_metrics(
+            profile_id=str(profile["profile_id"]),
+            window_start=start,
+            window_end=end,
+            limit=25,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            set(rows[0]),
+            {
+                "organization_scope",
+                "persona_key",
+                "language",
+                "command_family",
+                "status",
+                "sample_count",
+                "total_duration_ms",
+                "p50_duration_bucket_ms",
+                "p95_duration_bucket_ms",
+                "percentiles_approximate",
+            },
+        )
+        self.assertEqual(rows[0]["organization_scope"], scope)
+        self.assertEqual(rows[0]["command_family"], "cargo_build")
+        self.assertEqual(rows[0]["sample_count"], 3)
+        self.assertEqual(rows[0]["total_duration_ms"], 580)
+        self.assertEqual(rows[0]["p50_duration_bucket_ms"], 100)
+        self.assertEqual(rows[0]["p95_duration_bucket_ms"], 500)
+        self.assertTrue(rows[0]["percentiles_approximate"])
+        self.assertNotIn("cwd", rows[0])
+        self.assertNotIn("command", rows[0])
+        self.assertNotIn("output", rows[0])
+        self.assertNotIn("unknown_future_key", rows[0])
+
+        other = self.state(run_id=uuid.uuid4(), principal="workflow-heartbeat-other")
+        with self.assertRaises(PermissionError):
+            await other.aggregate_execution_metrics(
+                profile_id=str(profile["profile_id"]),
+                window_start=start,
+                window_end=end,
+            )
+        with self.assertRaises(ValueError):
+            await state.aggregate_execution_metrics(
+                profile_id=str(profile["profile_id"]),
+                window_start=start - dt.timedelta(days=14),
+                window_end=end,
+            )
+        with self.assertRaises(ValueError):
+            await state.aggregate_execution_metrics(
+                profile_id=str(profile["profile_id"]),
+                window_start=start,
+                window_end=end,
+                limit=26,
+            )
+        with self.assertRaises(ValueError):
+            await state.aggregate_execution_metrics(
+                profile_id=str(profile["profile_id"]),
+                window_start=start + dt.timedelta(minutes=1),
+                window_end=end,
+            )
+
+        await self.pool.execute(
+            """
+            insert into heartbeat_execution_metric_buckets (
+                organization_scope, persona_key, language, command_family,
+                bucket_start, duration_bucket_ms, status, sample_count,
+                total_duration_ms
+            ) values ($1, 'eng', 'rust', 'cargo_build',
+                      date_trunc('hour', (now() - interval '91 days') at time zone 'UTC') at time zone 'UTC', 100, 'completed', 3, 300)
+            """,
+            scope,
+        )
+        retention = await state.apply_execution_metric_retention(
+            str(profile["profile_id"])
+        )
+        self.assertEqual(set(retention), {"execution_metric_buckets_deleted"})
+        self.assertGreaterEqual(retention["execution_metric_buckets_deleted"], 1)
+
+        admin = await asyncpg.connect(DATABASE_URL)
+        try:
+            await admin.execute(
+                "delete from heartbeat_execution_metric_buckets where organization_scope in ($1, $2)",
+                scope,
+                other_scope,
+            )
+            await admin.execute(
+                "delete from heartbeat_profiles where profile_id = $1",
+                profile["profile_id"],
+            )
+        finally:
+            await admin.close()
 
     async def test_zz_memory_event_idempotency_is_namespaced_by_fact(self) -> None:
         state = self.state(run_id=uuid.uuid4())

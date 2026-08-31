@@ -1,6 +1,6 @@
 //! SQLx-backed session repository.
 
-use std::{collections::BTreeMap, str::FromStr, time::Duration};
+use std::{collections::BTreeMap, env, str::FromStr, time::Duration};
 
 use centaur_session_core::{
     ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxRepoCacheAccess,
@@ -10,8 +10,8 @@ use centaur_session_core::{
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::{
-    FromRow, PgPool,
-    postgres::{PgListener, PgPoolOptions},
+    Acquire, FromRow, PgPool,
+    postgres::{PgListener, PgPoolOptions, Postgres},
     types::Json,
 };
 use thiserror::Error;
@@ -22,7 +22,19 @@ use uuid::Uuid;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
+const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
+const EXECUTION_METRICS_SCOPE_ENV: &str = "CENTAUR_EXECUTION_METRICS_ORGANIZATION_SCOPE";
+const EXECUTION_METRIC_MAX_DURATION_MS: i64 = 86_400_000;
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedCommandMetricEvent {
+    item_id: String,
+    timestamp_ms: i64,
+    command: Option<String>,
+    status: Option<String>,
+    completed: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct CreateExecutionResult {
@@ -1098,6 +1110,21 @@ impl PgSessionStore {
         .fetch_one(&mut *tx)
         .await?;
 
+        if event_type == SESSION_OUTPUT_LINE_EVENT {
+            // Metrics are best-effort telemetry.  A missing deployment scope,
+            // persona, or an unrecognised protocol shape must not block the
+            // durable session event.
+            record_execution_metric_best_effort(
+                &mut tx,
+                thread_key,
+                execution_id,
+                row.event_id,
+                &row.payload,
+                row.created_at,
+            )
+            .await;
+        }
+
         tx.commit().await?;
         row.try_into().map(Some)
     }
@@ -2063,6 +2090,11 @@ struct SessionEventRow {
     created_at: OffsetDateTime,
 }
 
+#[derive(Debug, FromRow)]
+struct MetricEventPayloadRow {
+    payload: Value,
+}
+
 impl TryFrom<SessionEventRow> for SessionEvent {
     type Error = SessionStoreError;
 
@@ -2101,16 +2133,299 @@ fn stdout_lease_expires_at(lease: Duration) -> OffsetDateTime {
     OffsetDateTime::now_utc() + TimeDuration::new(seconds, lease.subsec_nanos() as i32)
 }
 
+async fn record_execution_metric_best_effort(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    thread_key: &ThreadKey,
+    execution_id: &str,
+    completed_event_id: i64,
+    payload: &Value,
+    captured_at: OffsetDateTime,
+) {
+    // Keep metric ingestion behind a savepoint.  An unavailable metric table,
+    // malformed deployment grant, or any other telemetry error must roll back
+    // only the optional aggregate write and never abort the session event
+    // transaction.
+    let mut metrics_tx = match tx.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::warn!(%error, "failed to start execution metric savepoint");
+            return;
+        }
+    };
+    match record_execution_metric(
+        &mut metrics_tx,
+        thread_key,
+        execution_id,
+        completed_event_id,
+        payload,
+        captured_at,
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Err(error) = metrics_tx.commit().await {
+                tracing::warn!(%error, "failed to commit execution metric savepoint");
+            }
+        }
+        Err(error) => {
+            let _ = metrics_tx.rollback().await;
+            tracing::warn!(%error, "failed to record execution metric");
+        }
+    }
+}
+
+async fn record_execution_metric<'a>(
+    tx: &mut sqlx::Transaction<'a, Postgres>,
+    thread_key: &ThreadKey,
+    execution_id: &str,
+    completed_event_id: i64,
+    payload: &Value,
+    captured_at: OffsetDateTime,
+) -> Result<(), sqlx::Error> {
+    let Some(completed) = parse_command_metric_event(payload, true) else {
+        return Ok(());
+    };
+    let Some(status) = (match completed.status.as_deref() {
+        Some("completed") => Some("completed"),
+        Some("failed") => Some("failed"),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+
+    let event_rows = sqlx::query_as::<_, MetricEventPayloadRow>(
+        r#"
+        select payload
+          from session_events
+         where execution_id = $1
+           and event_type = $2
+           and event_id < $3
+         order by event_id desc
+         limit 1000
+        "#,
+    )
+    .bind(execution_id)
+    .bind(SESSION_OUTPUT_LINE_EVENT)
+    .bind(completed_event_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut started = None;
+    for row in event_rows {
+        let Some(event) = parse_command_metric_event(&row.payload, false) else {
+            continue;
+        };
+        if event.item_id != completed.item_id {
+            continue;
+        }
+        if event.completed {
+            // At-least-once stdout delivery must not inflate a bucket when the
+            // same normalized completion is observed more than once.
+            return Ok(());
+        }
+        started = Some(event);
+        break;
+    }
+    let Some(started) = started else {
+        return Ok(());
+    };
+    let duration_ms = completed
+        .timestamp_ms
+        .checked_sub(started.timestamp_ms)
+        .filter(|duration| (1..=EXECUTION_METRIC_MAX_DURATION_MS).contains(duration));
+    let Some(duration_ms) = duration_ms else {
+        return Ok(());
+    };
+    let Some(command) = started.command.as_deref().or(completed.command.as_deref()) else {
+        return Ok(());
+    };
+    let Some(command_family) = command_family(command) else {
+        return Ok(());
+    };
+    let Some(organization_scope) = configured_execution_metric_scope() else {
+        return Ok(());
+    };
+    let persona_key = sqlx::query_scalar::<_, Option<String>>(
+        "select persona_id from sessions where thread_key = $1",
+    )
+    .bind(thread_key.as_str())
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten()
+    .and_then(|value| safe_dimension(&value));
+    let Some(persona_key) = persona_key else {
+        return Ok(());
+    };
+
+    sqlx::query(
+        r#"
+        insert into heartbeat_execution_metric_buckets (
+            organization_scope, persona_key, language, command_family,
+            bucket_start, duration_bucket_ms, status, sample_count,
+            total_duration_ms
+        ) values ($1, $2, 'rust', $3,
+                  date_trunc('hour', $4::timestamptz at time zone 'UTC') at time zone 'UTC',
+                  $5, $6, 1, $7)
+        on conflict (organization_scope, persona_key, language, command_family,
+                     bucket_start, duration_bucket_ms, status)
+        do update set sample_count = heartbeat_execution_metric_buckets.sample_count + 1,
+                      total_duration_ms = heartbeat_execution_metric_buckets.total_duration_ms
+                                          + excluded.total_duration_ms
+        "#,
+    )
+    .bind(organization_scope)
+    .bind(persona_key)
+    .bind(command_family)
+    .bind(captured_at)
+    .bind(duration_bucket(duration_ms))
+    .bind(status)
+    .bind(duration_ms)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn parse_command_metric_event(
+    payload: &Value,
+    completed: bool,
+) -> Option<ParsedCommandMetricEvent> {
+    let line = payload.as_str()?;
+    let value: Value = serde_json::from_str(line).ok()?;
+    let method = value.get("method").and_then(Value::as_str)?;
+    let is_completed = matches!(method, "item/completed" | "item.completed");
+    if is_completed != completed {
+        return None;
+    }
+    let item = value
+        .pointer("/params/item")
+        .or_else(|| value.get("item"))?;
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("commandExecution" | "command_execution")
+    ) {
+        return None;
+    }
+    let item_id = item.get("id").and_then(Value::as_str)?.to_owned();
+    let timestamp_ms = [
+        if completed {
+            "/params/completedAtMs"
+        } else {
+            "/params/startedAtMs"
+        },
+        if completed {
+            "/params/completed_at_ms"
+        } else {
+            "/params/started_at_ms"
+        },
+    ]
+    .into_iter()
+    .find_map(|path| value.pointer(path).and_then(Value::as_i64))?;
+    Some(ParsedCommandMetricEvent {
+        item_id,
+        timestamp_ms,
+        command: item
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        status: item
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        completed: is_completed,
+    })
+}
+
+fn command_family(command: &str) -> Option<&'static str> {
+    let mut words = shell_words::split(command).ok()?;
+    if words.is_empty() {
+        return None;
+    }
+    if matches!(executable_name(words.first()?), "bash" | "sh" | "zsh") {
+        if !matches!(words.get(1).map(String::as_str), Some("-c" | "-lc")) || words.len() != 3 {
+            return None;
+        }
+        words = shell_words::split(words.get(2)?).ok()?;
+    }
+    if words.is_empty()
+        || words.iter().any(|word| {
+            word.chars()
+                .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`'))
+                || word.contains("$(")
+        })
+    {
+        return None;
+    }
+    match executable_name(words.first()?) {
+        "rustc"
+            if words.len() > 1
+                && !words.iter().skip(1).any(|word| {
+                    matches!(word.as_str(), "--version" | "-V" | "--help" | "-h")
+                        || word.starts_with("--version=")
+                        || word.starts_with("--help=")
+                        || word.starts_with("-V")
+                }) =>
+        {
+            Some("rustc")
+        }
+        "cargo" => match words.get(1).map(String::as_str) {
+            Some("build") => Some("cargo_build"),
+            Some("check") => Some("cargo_check"),
+            Some("test") => Some("cargo_test"),
+            Some("clippy") => Some("cargo_clippy"),
+            Some("doc") => Some("cargo_doc"),
+            Some("bench") => Some("cargo_bench"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn executable_name(value: &str) -> &str {
+    value.rsplit('/').next().unwrap_or(value)
+}
+
+fn configured_execution_metric_scope() -> Option<String> {
+    env::var(EXECUTION_METRICS_SCOPE_ENV)
+        .ok()
+        .and_then(|value| safe_dimension(value.trim()))
+}
+
+fn safe_dimension(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.chars().enumerate().all(|(index, ch)| {
+            (index == 0 && ch.is_ascii_alphanumeric())
+                || (index > 0
+                    && (ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | ':' | '-')))
+        })
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn duration_bucket(duration_ms: i64) -> i32 {
+    [
+        100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 300000, 900000, 3600000, 86400000,
+    ]
+    .into_iter()
+    .find(|bucket| duration_ms <= i64::from(*bucket))
+    .unwrap_or(86400000)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
     use centaur_session_core::{HarnessType, ThreadKey};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
 
-    use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
+    use super::{
+        IdleSandboxCandidateRow, PgSessionStore, SESSION_OUTPUT_LINE_EVENT,
+        SessionEventNotification, command_family, parse_command_metric_event, safe_dimension,
+    };
 
     async fn test_store() -> Option<PgSessionStore> {
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
@@ -2732,5 +3047,359 @@ mod tests {
                 .expect("list referenced sandboxes")
                 .contains(&sandbox_id)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn normalized_rust_execution_events_write_only_aggregate_metrics() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = format!("metrics-test-{}", Uuid::new_v4().simple());
+        let prior_scope = std::env::var(super::EXECUTION_METRICS_SCOPE_ENV).ok();
+        unsafe { std::env::set_var(super::EXECUTION_METRICS_SCOPE_ENV, &scope) };
+        let thread_key =
+            ThreadKey::parse(format!("test:execution-metrics-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                Some("engineering"),
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create metrics session");
+        let execution_id = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create metrics execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&execution_id)
+            .await
+            .expect("mark metrics execution running");
+        assert!(
+            store
+                .claim_stdout_owner(&execution_id, "metrics-owner", Duration::from_secs(5))
+                .await
+                .expect("claim metrics stdout")
+        );
+
+        let started = json!({
+            "method": "item/started",
+            "params": {
+                "startedAtMs": 1_000,
+                "item": {
+                    "id": "metric-item",
+                    "type": "commandExecution",
+                    "command": "cargo build --release",
+                    "cwd": "/private/repo",
+                    "arguments": {"prompt": "private"}
+                }
+            }
+        });
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "completedAtMs": 6_500,
+                "item": {
+                    "id": "metric-item",
+                    "type": "commandExecution",
+                    "status": "completed",
+                    "output": "private output"
+                },
+                "unknown_future_key": "must not persist"
+            }
+        });
+        for event in [&started, &completed, &completed] {
+            store
+                .append_event_if_stdout_owner(
+                    &thread_key,
+                    &execution_id,
+                    "metrics-owner",
+                    Duration::from_secs(5),
+                    SESSION_OUTPUT_LINE_EVENT,
+                    Value::String(event.to_string()),
+                )
+                .await
+                .expect("append normalized event")
+                .expect("owner appends normalized event");
+        }
+
+        let aggregate = sqlx::query_as::<_, (String, String, String, String, i64, i64)>(
+            "select organization_scope, persona_key, language, command_family, sample_count, total_duration_ms from heartbeat_execution_metric_buckets where organization_scope = $1 and persona_key = 'engineering'",
+        )
+        .bind(&scope)
+        .fetch_one(store.pool())
+        .await
+        .expect("load aggregate metric");
+        assert_eq!(aggregate.0, scope);
+        assert_eq!(aggregate.1, "engineering");
+        assert_eq!(aggregate.2, "rust");
+        assert_eq!(aggregate.3, "cargo_build");
+        assert_eq!(aggregate.4, 1);
+        assert_eq!(aggregate.5, 5_500);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from information_schema.columns where table_name = 'heartbeat_execution_metric_buckets' and column_name in ('command', 'arguments', 'cwd', 'output', 'prompt', 'thread_key', 'execution_id', 'item_id')",
+            )
+            .fetch_one(store.pool())
+            .await
+            .expect("inspect aggregate schema"),
+            0
+        );
+
+        let unknown_execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create unknown execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&unknown_execution)
+            .await
+            .expect("mark unknown execution running");
+        assert!(
+            store
+                .claim_stdout_owner(&unknown_execution, "metrics-owner", Duration::from_secs(5))
+                .await
+                .expect("claim unknown stdout")
+        );
+        let unknown = json!({
+            "method": "item/completed",
+            "params": {
+                "completedAtMs": 2_000,
+                "item": {"id": "unknown", "type": "commandExecution", "status": "completed", "command": "cargo metadata"}
+            }
+        });
+        store
+            .append_event_if_stdout_owner(
+                &thread_key,
+                &unknown_execution,
+                "metrics-owner",
+                Duration::from_secs(5),
+                SESSION_OUTPUT_LINE_EVENT,
+                Value::String(unknown.to_string()),
+            )
+            .await
+            .expect("append unknown command")
+            .expect("owner appends unknown command");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from heartbeat_execution_metric_buckets where organization_scope = $1",
+            )
+            .bind(&scope)
+            .fetch_one(store.pool())
+            .await
+            .expect("count aggregate metrics"),
+            1
+        );
+
+        unsafe { std::env::remove_var(super::EXECUTION_METRICS_SCOPE_ENV) };
+        let no_scope_execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .expect("create no-scope execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&no_scope_execution)
+            .await
+            .expect("mark no-scope execution running");
+        assert!(
+            store
+                .claim_stdout_owner(&no_scope_execution, "metrics-owner", Duration::from_secs(5))
+                .await
+                .expect("claim no-scope stdout")
+        );
+        let no_scope_started = json!({
+            "method": "item/started",
+            "params": {"startedAtMs": 1_000, "item": {"id": "no-scope", "type": "commandExecution", "command": "cargo check"}}
+        });
+        let no_scope_completed = json!({
+            "method": "item/completed",
+            "params": {"completedAtMs": 2_000, "item": {"id": "no-scope", "type": "commandExecution", "status": "completed"}}
+        });
+        for event in [&no_scope_started, &no_scope_completed] {
+            store
+                .append_event_if_stdout_owner(
+                    &thread_key,
+                    &no_scope_execution,
+                    "metrics-owner",
+                    Duration::from_secs(5),
+                    SESSION_OUTPUT_LINE_EVENT,
+                    Value::String(event.to_string()),
+                )
+                .await
+                .expect("append no-scope event")
+                .expect("owner appends no-scope event");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from heartbeat_execution_metric_buckets where organization_scope = $1",
+            )
+            .bind(&scope)
+            .fetch_one(store.pool())
+            .await
+            .expect("count no-scope aggregate metrics"),
+            1
+        );
+
+        unsafe { std::env::set_var(super::EXECUTION_METRICS_SCOPE_ENV, &scope) };
+        let no_persona_thread = ThreadKey::parse(format!(
+            "test:execution-metrics-no-persona-{}",
+            Uuid::new_v4()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(
+                &no_persona_thread,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create no-persona session");
+        let no_persona_execution = store
+            .create_execution(&no_persona_thread, None, json!({}))
+            .await
+            .expect("create no-persona execution")
+            .execution
+            .execution_id;
+        store
+            .mark_execution_running(&no_persona_execution)
+            .await
+            .expect("mark no-persona execution running");
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &no_persona_execution,
+                    "metrics-owner",
+                    Duration::from_secs(5)
+                )
+                .await
+                .expect("claim no-persona stdout")
+        );
+        let no_persona_started = json!({
+            "method": "item/started",
+            "params": {"startedAtMs": 1_000, "item": {"id": "no-persona", "type": "commandExecution", "command": "cargo check"}}
+        });
+        let no_persona_completed = json!({
+            "method": "item/completed",
+            "params": {"completedAtMs": 2_000, "item": {"id": "no-persona", "type": "commandExecution", "status": "completed"}}
+        });
+        for event in [&no_persona_started, &no_persona_completed] {
+            store
+                .append_event_if_stdout_owner(
+                    &no_persona_thread,
+                    &no_persona_execution,
+                    "metrics-owner",
+                    Duration::from_secs(5),
+                    SESSION_OUTPUT_LINE_EVENT,
+                    Value::String(event.to_string()),
+                )
+                .await
+                .expect("append no-persona event")
+                .expect("owner appends no-persona event");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from heartbeat_execution_metric_buckets where organization_scope = $1",
+            )
+            .bind(&scope)
+            .fetch_one(store.pool())
+            .await
+            .expect("count no-persona aggregate metrics"),
+            1
+        );
+
+        sqlx::query("delete from heartbeat_execution_metric_buckets where organization_scope = $1")
+            .bind(&scope)
+            .execute(store.pool())
+            .await
+            .expect("cleanup aggregate metrics");
+        sqlx::query("delete from sessions where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(store.pool())
+            .await
+            .expect("cleanup metrics session");
+        sqlx::query("delete from sessions where thread_key = $1")
+            .bind(no_persona_thread.as_str())
+            .execute(store.pool())
+            .await
+            .expect("cleanup no-persona session");
+        match prior_scope {
+            Some(value) => unsafe { std::env::set_var(super::EXECUTION_METRICS_SCOPE_ENV, value) },
+            None => unsafe { std::env::remove_var(super::EXECUTION_METRICS_SCOPE_ENV) },
+        }
+    }
+
+    #[test]
+    fn command_metric_parser_accepts_only_allowlisted_rust_families() {
+        assert_eq!(command_family("cargo build --release"), Some("cargo_build"));
+        assert_eq!(
+            command_family("/bin/bash -lc 'cargo clippy --all-targets'"),
+            Some("cargo_clippy")
+        );
+        assert_eq!(command_family("rustc --version"), None);
+        assert_eq!(command_family("rustc -V"), None);
+        assert_eq!(command_family("rustc -Vv"), None);
+        assert_eq!(command_family("rustc --help"), None);
+        assert_eq!(command_family("cargo metadata"), None);
+        assert_eq!(command_family("cargo build && curl example.invalid"), None);
+    }
+
+    #[test]
+    fn command_metric_parser_ignores_unlisted_payload_keys() {
+        let payload = Value::String(
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "completedAtMs": 1_500,
+                    "item": {
+                        "id": "item-private",
+                        "type": "commandExecution",
+                        "status": "completed",
+                        "command": "cargo test",
+                        "cwd": "/private/repo",
+                        "arguments": {"prompt": "private"},
+                        "output": "private output",
+                        "unknown_future_key": "must not affect metrics"
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let parsed = parse_command_metric_event(&payload, true).expect("completed event");
+        assert_eq!(parsed.item_id, "item-private");
+        assert_eq!(parsed.timestamp_ms, 1_500);
+        assert_eq!(parsed.command.as_deref(), Some("cargo test"));
+        assert_eq!(parsed.status.as_deref(), Some("completed"));
+        // The transient parser result is never serialized or inserted. The
+        // durable row receives only the derived dimensions and timing bucket.
+        assert_eq!(
+            command_family(parsed.command.as_deref().unwrap()),
+            Some("cargo_test")
+        );
+    }
+
+    #[test]
+    fn command_metric_parser_requires_protocol_timestamps_and_safe_dimensions() {
+        let missing_timestamp = Value::String(
+            json!({
+                "method": "item/started",
+                "params": {"item": {"id": "x", "type": "commandExecution", "command": "cargo test"}}
+            })
+            .to_string(),
+        );
+        assert!(parse_command_metric_event(&missing_timestamp, false).is_none());
+        assert_eq!(
+            safe_dimension("engineering"),
+            Some("engineering".to_owned())
+        );
+        assert_eq!(safe_dimension("/private/repo"), None);
+        assert_eq!(safe_dimension(""), None);
     }
 }

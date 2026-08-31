@@ -38,6 +38,20 @@ _MAX_MEMORY_SUBJECT_OR_PREDICATE_CHARS = 256
 _MAX_MEMORY_CANONICAL_CHARS = 1000
 _MAX_MEMORY_VALUE_BYTES = 2048
 _MAX_MEMORY_EVIDENCE_IDS = 10
+_MAX_EXECUTION_METRIC_WINDOW = dt.timedelta(days=14)
+_MAX_EXECUTION_METRIC_ROWS = 25
+_EXECUTION_METRIC_FIELDS = (
+    "organization_scope",
+    "persona_key",
+    "language",
+    "command_family",
+    "status",
+    "sample_count",
+    "total_duration_ms",
+    "p50_duration_bucket_ms",
+    "p95_duration_bucket_ms",
+    "percentiles_approximate",
+)
 
 
 def _json(value: Any) -> str:
@@ -342,6 +356,75 @@ class HeartbeatState:
             "source_key": source_key,
             "version": 0,
         }
+
+    async def aggregate_execution_metrics(
+        self,
+        *,
+        profile_id: str,
+        window_start: Any,
+        window_end: Any,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Read bounded Rust build/check/test command-time aggregates.
+
+        The database facade returns only fixed duration-bucket aggregates. It
+        deliberately does not expose event, session, command, path, or actor
+        identifiers. These are command times, not compile-only times (for
+        example, tests and documentation can include non-compilation work);
+        p50/p95 are explicitly approximate bucket bounds.
+        """
+        self._require_ready()
+        if self.workflow_name != "heartbeat_run":
+            raise PermissionError("workflow is not authorized for execution metrics")
+        profile_uuid = _parse_uuid(profile_id, "profile_id")
+        start = _parse_time(window_start)
+        end = _parse_time(window_end)
+        if start is not None and start.tzinfo is None:
+            start = start.replace(tzinfo=dt.UTC)
+        if end is not None and end.tzinfo is None:
+            end = end.replace(tzinfo=dt.UTC)
+        if start is not None:
+            start = start.astimezone(dt.UTC)
+        if end is not None:
+            end = end.astimezone(dt.UTC)
+        if start is None or end is None or start >= end:
+            raise ValueError("execution metric window must be positive")
+        if end - start > _MAX_EXECUTION_METRIC_WINDOW:
+            raise ValueError("execution metric window must be at most 14 days")
+        if any(
+            (
+                value.minute,
+                value.second,
+                value.microsecond,
+            )
+            != (0, 0, 0)
+            for value in (start, end)
+        ):
+            raise ValueError("execution metric window must be UTC-hour aligned")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _MAX_EXECUTION_METRIC_ROWS
+        ):
+            raise ValueError("execution metric limit must be between 1 and 25")
+        await self._require_profile_executor(profile_uuid)
+        rows = await self._pool.fetch(
+            """
+            select organization_scope, persona_key, language, command_family,
+                   status, sample_count, total_duration_ms,
+                   p50_duration_bucket_ms, p95_duration_bucket_ms,
+                   percentiles_approximate
+              from heartbeat_aggregate_execution_metrics($1, $2, $3, $4)
+            """,
+            profile_uuid,
+            start,
+            end,
+            limit,
+        )
+        return [
+            {field: row[field] for field in _EXECUTION_METRIC_FIELDS}
+            for row in rows
+        ]
 
     async def commit_source_batch(
         self,
@@ -2136,6 +2219,32 @@ class HeartbeatState:
                 raise PermissionError("heartbeat retention is not authorized") from exc
             raise RuntimeError("heartbeat retention failed") from exc
         return _json_value(result) or {}
+
+    async def apply_execution_metric_retention(self, profile_id: str) -> dict[str, int]:
+        """Delete execution metric buckets older than the fixed 90-day limit."""
+        self._require_ready()
+        if self.workflow_name != "heartbeat_run":
+            raise PermissionError("retention requires the heartbeat run workflow")
+        profile_uuid = _parse_uuid(profile_id, "profile_id")
+        await self._require_profile_executor(profile_uuid)
+        try:
+            async with self._pool.acquire() as connection:
+                result = await connection.fetchval(
+                    "select heartbeat_apply_execution_metric_retention($1)",
+                    profile_uuid,
+                )
+        except Exception as exc:
+            message = str(exc)
+            if "requires the heartbeat run workflow" in message or "does not operate" in message:
+                raise PermissionError(
+                    "execution metric retention is not authorized"
+                ) from exc
+            raise RuntimeError("execution metric retention failed") from exc
+        value = _json_value(result) or {}
+        deleted = value.get("execution_metric_buckets_deleted")
+        if isinstance(deleted, bool) or not isinstance(deleted, int) or deleted < 0:
+            raise RuntimeError("execution metric retention returned an invalid count")
+        return {"execution_metric_buckets_deleted": deleted}
 
     async def mark_delivery_sent(
         self,
