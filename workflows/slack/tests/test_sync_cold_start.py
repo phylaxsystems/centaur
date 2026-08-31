@@ -22,6 +22,7 @@ def _load_sync():
 
     etl_metrics = types.ModuleType("workflows.etl_metrics")
     for name in (
+        "record_etl_items_deleted",
         "record_etl_items_enqueued",
         "record_etl_items_failed",
         "record_etl_items_seen",
@@ -121,6 +122,14 @@ async def _zero(*_args, **_kwargs):
     return 0
 
 
+async def _zero_purge(*_args, **_kwargs):
+    return {
+        "company_context_documents": 0,
+        "public_channels": 0,
+        "private_channels": 0,
+    }
+
+
 def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
     calls: dict[str, list] = {
         "checkpoint_success": [],
@@ -162,6 +171,7 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
 
     monkeypatch.setattr(sync, "_client", lambda: fake_client)
     monkeypatch.setattr(sync, "_upsert_channels", _noop)
+    monkeypatch.setattr(sync, "_purge_excluded_channel_data", _zero_purge)
     monkeypatch.setattr(sync, "_upsert_users", _zero)
     monkeypatch.setattr(sync, "_load_checkpoint", fake_load_checkpoint)
     monkeypatch.setattr(sync, "_upsert_messages", fake_upsert_messages)
@@ -179,6 +189,103 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
     )
 
     return fake_client, calls
+
+
+class FakePurgeConnection:
+    def __init__(self) -> None:
+        self.fetchval_calls: list[tuple[str, tuple]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    def transaction(self):
+        return self
+
+    async def fetch(self, query):
+        if "FROM slack_sync_channels" in query:
+            return [
+                {"channel_id": "C_STORED", "channel_name": "Sensitive-Archive"},
+                {"channel_id": "C_GENERAL", "channel_name": "general"},
+            ]
+        if "FROM slack_private_sync_conversations" in query:
+            return [
+                {
+                    "home_team_id": "T1",
+                    "conversation_id": "G_PRIVATE",
+                    "channel_name": "sensitive-private",
+                },
+                {
+                    "home_team_id": "T1",
+                    "conversation_id": "G_STRATEGY",
+                    "channel_name": "strategy",
+                },
+            ]
+        raise AssertionError(f"unexpected query: {query}")
+
+    async def fetchval(self, query, *args):
+        self.fetchval_calls.append((query, args))
+        if "DELETE FROM company_context_documents" in query:
+            return 3
+        if "DELETE FROM slack_sync_channels" in query:
+            return 2
+        if "DELETE FROM slack_private_sync_conversations" in query:
+            return 1
+        raise AssertionError(f"unexpected query: {query}")
+
+
+class FakePurgePool:
+    def __init__(self) -> None:
+        self.connection = FakePurgeConnection()
+
+    def acquire(self):
+        return self.connection
+
+
+def test_channel_exclusion_accepts_exact_channel_id_after_rename():
+    sync = _load_sync()
+
+    included, excluded = sync._filter_excluded_channels(
+        [
+            {"id": "C_EXCLUDED", "name": "renamed-room"},
+            {"id": "C_INCLUDED", "name": "general"},
+        ],
+        sync._channel_exclusion_patterns("c_excluded"),
+    )
+
+    assert [channel["id"] for channel in included] == ["C_INCLUDED"]
+    assert excluded == [
+        {
+            "channel_id": "C_EXCLUDED",
+            "channel_name": "renamed-room",
+            "reason": "excluded_by_config:c_excluded",
+        }
+    ]
+
+
+def test_purge_excluded_channel_data_removes_public_private_and_derived_rows():
+    sync = _load_sync()
+    pool = FakePurgePool()
+
+    result = asyncio.run(
+        sync._purge_excluded_channel_data(
+            pool,
+            ["sensitive-*"],
+            [{"id": "C_DISCOVERED", "name": "sensitive-current"}],
+        )
+    )
+
+    assert result == {
+        "company_context_documents": 3,
+        "public_channels": 2,
+        "private_channels": 1,
+    }
+    calls = pool.connection.fetchval_calls
+    assert calls[0][1] == (["C_DISCOVERED", "C_STORED", "G_PRIVATE"],)
+    assert calls[1][1] == (["C_DISCOVERED", "C_STORED", "G_PRIVATE"],)
+    assert calls[2][1] == (["T1"], ["G_PRIVATE"])
 
 
 def test_cold_start_channel_uses_full_lookback_window(monkeypatch):

@@ -31,6 +31,7 @@ def _load_sync():
 
     etl_metrics = types.ModuleType("workflows.etl_metrics")
     for name in (
+        "record_etl_items_deleted",
         "record_etl_items_enqueued",
         "record_etl_items_failed",
         "record_etl_items_seen",
@@ -147,6 +148,14 @@ async def _zero(*_args, **_kwargs):
     return 0
 
 
+async def _zero_purge(*_args, **_kwargs):
+    return {
+        "company_context_documents": 0,
+        "public_channels": 0,
+        "private_channels": 0,
+    }
+
+
 def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
     calls: dict[str, list] = {
         "checkpoint_success": [],
@@ -176,6 +185,7 @@ def _patch_handler_io(monkeypatch, sync, *, checkpoint=None, client=None):
 
     monkeypatch.setattr(sync, "_client", lambda: fake_client)
     monkeypatch.setattr(sync, "_upsert_channels", _noop)
+    monkeypatch.setattr(sync, "_purge_excluded_channel_data", _zero_purge)
     monkeypatch.setattr(sync, "_upsert_users", _zero)
     monkeypatch.setattr(sync, "_load_checkpoint", fake_load_checkpoint)
     monkeypatch.setattr(sync, "_upsert_messages", fake_upsert_messages)

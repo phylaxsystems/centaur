@@ -274,7 +274,7 @@ module SlackDm
             "channels" => [
               {
                 "id" => "G123",
-                "name" => "leadership",
+                "name" => "strategy",
                 "is_private" => true,
                 "is_archived" => false
               }
@@ -314,9 +314,61 @@ module SlackDm
 
       batch = api_client.batch
       assert_equal "private_channel", batch[:conversations].first[:conversation_type]
-      assert_equal "leadership", batch[:conversations].first[:raw_payload]["name"]
+      assert_equal "strategy", batch[:conversations].first[:raw_payload]["name"]
       assert_equal %w[U_ME U_OTHER], batch[:members].map { |member| member[:user_id] }
       assert_equal "private roadmap", batch[:messages].first[:text]
+    end
+
+    test "sync excludes configured private channels before membership and history reads" do
+      env_key = "CENTAUR_CONSOLE_SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS"
+      previous = ENV[env_key]
+      ENV[env_key] = "#sensitive-*, exact-room, g_excluded_id"
+      api_client = FakeApiClient.new
+      membership_calls = []
+      history_calls = []
+      slack_http = lambda do |endpoint:, params:, access_token:|
+        assert_equal "xoxp-live", access_token
+        case endpoint
+        when SlackDm::SyncCredential::AUTH_TEST_ENDPOINT
+          { "ok" => true, "team_id" => "T123", "user_id" => "U_ME" }
+        when SlackDm::SyncCredential::CONVERSATIONS_LIST_ENDPOINT
+          {
+            "ok" => true,
+            "channels" => [
+              { "id" => "G_EXCLUDED_NAME", "name" => "Sensitive-Roadmap", "is_private" => true },
+              { "id" => "G_EXCLUDED_ID", "name" => "renamed-room", "is_private" => true },
+              { "id" => "G_INCLUDED", "name" => "strategy", "is_private" => true }
+            ],
+            "response_metadata" => { "next_cursor" => "" }
+          }
+        when SlackDm::SyncCredential::CONVERSATIONS_MEMBERS_ENDPOINT
+          membership_calls << params.fetch("channel")
+          {
+            "ok" => true,
+            "members" => %w[U_ME U_OTHER],
+            "response_metadata" => { "next_cursor" => "" }
+          }
+        when SlackDm::SyncCredential::CONVERSATIONS_HISTORY_ENDPOINT
+          history_calls << params.fetch("channel")
+          { "ok" => true, "messages" => [], "response_metadata" => { "next_cursor" => "" } }
+        else
+          flunk "unexpected Slack endpoint #{endpoint}"
+        end
+      end
+
+      SlackDm::SyncCredential.new(
+        credential,
+        api_client: api_client,
+        slack_api_http: slack_http
+      ).call
+
+      assert_equal [ "G_INCLUDED" ], membership_calls
+      assert_equal [ "G_INCLUDED" ], history_calls
+      assert_equal [ "G_INCLUDED" ],
+                   api_client.batch[:conversations].map { |row| row[:conversation_id] }
+      assert_equal 1, api_client.final_batch[:run][:conversations_requested]
+    ensure
+      previous.nil? ? ENV.delete(env_key) : ENV[env_key] = previous
     end
 
     test "sync never replaces membership from truncated pagination" do

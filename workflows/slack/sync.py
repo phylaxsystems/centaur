@@ -11,6 +11,7 @@ from typing import Any
 
 from api.runtime_control import canonical_json
 from workflows.etl_metrics import (
+    record_etl_items_deleted,
     record_etl_items_enqueued,
     record_etl_items_failed,
     record_etl_items_seen,
@@ -67,7 +68,7 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
 
 
 def _channel_exclusion_patterns(value: str | None) -> list[str]:
-    """Parse comma-separated Slack channel exclusion globs."""
+    """Parse comma-separated Slack channel name/ID exclusion globs."""
     if not value:
         return []
     patterns = []
@@ -83,15 +84,24 @@ def _channel_name(channel: dict[str, Any]) -> str:
     return str(channel.get("name") or "").strip().lower().lstrip("#")
 
 
+def _channel_id(channel: dict[str, Any]) -> str:
+    """Return the normalized Slack channel ID used for config matching."""
+    return str(channel.get("id") or "").strip().lower()
+
+
 def _channel_exclusion_reason(
     channel: dict[str, Any], patterns: list[str]
 ) -> str | None:
     """Return the configured pattern excluding a channel, if any."""
-    name = _channel_name(channel)
-    if not name:
+    identifiers = tuple(
+        identifier
+        for identifier in (_channel_name(channel), _channel_id(channel))
+        if identifier
+    )
+    if not identifiers:
         return None
     for pattern in patterns:
-        if fnmatch.fnmatchcase(name, pattern):
+        if any(fnmatch.fnmatchcase(identifier, pattern) for identifier in identifiers):
             return f"excluded_by_config:{pattern}"
     return None
 
@@ -110,6 +120,94 @@ def _filter_excluded_channels(
         else:
             included.append(channel)
     return included, excluded
+
+
+async def _purge_excluded_channel_data(
+    pool,
+    patterns: list[str],
+    discovered_channels: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Delete durable public/private Slack data whose channel name is excluded."""
+    if not patterns:
+        return {
+            "company_context_documents": 0,
+            "public_channels": 0,
+            "private_channels": 0,
+        }
+
+    async with pool.acquire() as conn:
+        public_rows = await conn.fetch(
+            "SELECT channel_id, channel_name FROM slack_sync_channels"
+        )
+        private_rows = await conn.fetch(
+            "SELECT home_team_id, conversation_id, raw_payload ->> 'name' AS channel_name "
+            "FROM slack_private_sync_conversations "
+            "WHERE conversation_type = 'private_channel'"
+        )
+
+        public_channel_ids = {
+            str(channel.get("id") or "")
+            for channel in discovered_channels
+            if str(channel.get("id") or "")
+        }
+        public_channel_ids.update(
+            str(row["channel_id"])
+            for row in public_rows
+            if _channel_exclusion_reason(
+                {"id": row["channel_id"], "name": row["channel_name"]}, patterns
+            )
+        )
+        private_channel_keys = {
+            (str(row["home_team_id"]), str(row["conversation_id"]))
+            for row in private_rows
+            if _channel_exclusion_reason(
+                {"id": row["conversation_id"], "name": row["channel_name"]}, patterns
+            )
+        }
+        all_channel_ids = sorted(
+            public_channel_ids
+            | {conversation_id for _, conversation_id in private_channel_keys}
+        )
+        private_channel_keys_sorted = sorted(private_channel_keys)
+
+        async with conn.transaction():
+            documents_deleted = await conn.fetchval(
+                "WITH deleted AS ("
+                "  DELETE FROM company_context_documents "
+                "  WHERE source = 'slack' "
+                "    AND metadata ->> 'channel_id' = ANY($1::text[]) "
+                "  RETURNING 1"
+                ") SELECT COUNT(*)::bigint FROM deleted",
+                all_channel_ids,
+            )
+            public_channels_deleted = await conn.fetchval(
+                "WITH deleted AS ("
+                "  DELETE FROM slack_sync_channels "
+                "  WHERE channel_id = ANY($1::text[]) "
+                "  RETURNING 1"
+                ") SELECT COUNT(*)::bigint FROM deleted",
+                all_channel_ids,
+            )
+            private_channels_deleted = await conn.fetchval(
+                "WITH excluded(home_team_id, conversation_id) AS ("
+                "  SELECT * FROM unnest($1::text[], $2::text[])"
+                "), deleted AS ("
+                "  DELETE FROM slack_private_sync_conversations conversations "
+                "  USING excluded "
+                "  WHERE conversations.home_team_id = excluded.home_team_id "
+                "    AND conversations.conversation_id = excluded.conversation_id "
+                "    AND conversations.conversation_type = 'private_channel' "
+                "  RETURNING 1"
+                ") SELECT COUNT(*)::bigint FROM deleted",
+                [team_id for team_id, _ in private_channel_keys_sorted],
+                [channel_id for _, channel_id in private_channel_keys_sorted],
+            )
+
+    return {
+        "company_context_documents": int(documents_deleted or 0),
+        "public_channels": int(public_channels_deleted or 0),
+        "private_channels": int(private_channels_deleted or 0),
+    }
 
 
 def _channel_is_non_member(channel: dict[str, Any]) -> bool:
@@ -432,6 +530,19 @@ async def handler(inp: Input, ctx: WorkflowContext) -> dict[str, Any]:
             patterns=exclusion_patterns,
             channels=excluded_channels,
         )
+    purge_counts = await _purge_excluded_channel_data(
+        ctx._pool,
+        exclusion_patterns,
+        [
+            channel
+            for channel in channels
+            if _channel_exclusion_reason(channel, exclusion_patterns)
+        ],
+    )
+    for entity, count in purge_counts.items():
+        record_etl_items_deleted("slack", "channel", entity, count)
+    if any(purge_counts.values()):
+        ctx.log("slack_sync_excluded_channel_data_purged", **purge_counts)
     channels_to_sync, non_member_channels = _filter_non_member_channels(
         channels_to_sync,
     )
