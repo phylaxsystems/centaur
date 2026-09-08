@@ -107,6 +107,65 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
     refute principal.grants.exists?(static_secret: other_secret)
   end
 
+  test "GitHub requester receives every OAuth credential owned by the consenting user" do
+    user = users(:member_user)
+    oauth_apps(:acme_github).update!(always_available: true)
+    oauth_apps(:acme_linear).update!(always_available: true)
+    github = create_credential(oauth_apps(:acme_github), "12345", nil, created_by: user)
+    linear = create_credential(
+      oauth_apps(:acme_linear), "linear-member", "member@acme.example", created_by: user
+    )
+    github_secret = wrap(github)
+    linear_secret = wrap(linear)
+
+    principal = Principal.create!(
+      foreign_id: "github-user-12345",
+      kind: "github_user",
+      labels: { "github_subject" => "12345" },
+      created_by: users(:acme_admin)
+    )
+
+    assert principal.grants.exists?(static_secret: github_secret)
+    assert principal.grants.exists?(static_secret: linear_secret)
+    assert_equal "github,linear", principal.reload.labels["requester_oauth_providers"]
+  end
+
+  test "GitHub requester without matching consent receives no credentials" do
+    linear = create_credential(
+      oauth_apps(:acme_linear), "linear-unmapped", "member@acme.example",
+      created_by: users(:member_user)
+    )
+    secret = wrap(linear)
+
+    principal = Principal.create!(
+      foreign_id: "github-user-99999",
+      kind: "github_user",
+      labels: { "github_subject" => "99999" },
+      created_by: users(:acme_admin)
+    )
+
+    refute principal.grants.exists?(static_secret: secret)
+  end
+
+  test "ambiguous GitHub subject does not anchor either credential owner" do
+    first = create_credential(
+      oauth_apps(:acme_github), "77777", nil, created_by: users(:member_user)
+    )
+    second = create_credential(
+      oauth_apps(:acme_github), "77777", nil, created_by: users(:globex_admin)
+    )
+    secrets = [ wrap(first), wrap(second) ]
+
+    principal = Principal.create!(
+      foreign_id: "github-user-77777",
+      kind: "github_user",
+      labels: { "github_subject" => "77777" },
+      created_by: users(:acme_admin)
+    )
+
+    secrets.each { |secret| refute principal.grants.exists?(static_secret: secret) }
+  end
+
   test "changing first-class Slack identity fields grants an existing matching wrapper" do
     principal = principals(:acme_user_alice)
     credential = create_credential(oauth_apps(:acme_slack), "U0123456789", "wrong@example.com")

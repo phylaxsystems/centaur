@@ -6,6 +6,7 @@ import type {
   JsonObject,
   JsonValue,
   GithubbotApiAttachment,
+  GithubbotApiAuthor,
   GithubbotApiMessage,
   GithubbotAppendMessagesRequest,
   GithubbotCreateSessionRequest,
@@ -736,7 +737,37 @@ function sessionMetadata(
     timestamp: message.timestamp,
     user_id: message.author.userId,
     user_name: message.author.userName,
+    ...githubRequesterRequirements(message.author),
+    ...githubLifecycleRequesterMetadata(message),
     ...extra,
+  };
+}
+
+export function githubRequesterRequirements(author: GithubbotApiAuthor): JsonObject {
+  if (!/^[1-9][0-9]*$/.test(author.userId.trim())) return {};
+  return {
+    requester_credentials_required: true,
+    requester_required_providers: ["github", "linear"],
+    requester_origin: "github_user",
+  };
+}
+
+export function githubLifecycleRequesterMetadata(message: GithubbotApiMessage): JsonObject {
+  if (
+    message.author.userId !== "github-pr-manager" ||
+    !isJsonObject(message.raw) ||
+    message.raw.githubbotManagement !== true ||
+    message.raw.requesterPrincipalForeignId !== "linearbot-agent" ||
+    typeof message.raw.linearIssueIdentifier !== "string"
+  ) {
+    return {};
+  }
+  return {
+    requester_principal_foreign_id: "linearbot-agent",
+    requester_credentials_required: true,
+    requester_required_providers: ["linear"],
+    requester_origin: "linear_app",
+    linear_issue_identifier: message.raw.linearIssueIdentifier,
   };
 }
 

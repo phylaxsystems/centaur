@@ -65,6 +65,13 @@ retryable session-api failure answers **503** and Linear redelivers. The execute
 the background render — after the working ack — because cold sandbox spin-up far exceeds Linear's
 webhook deadline. Multiple replicas are fine.
 
+Every executed turn binds the fetch-only `linearbot-agent` requester principal.
+Deployments grant that principal a dedicated wrapper around the same
+`actor=app` credential used by the ingress, so sandbox Linear calls retain app
+attribution without restoring a shared human token. The binding is required and
+fails before sandbox provisioning when the principal or its direct grant is
+missing.
+
 ## Auth
 
 A Linear token is required — set exactly one of two paths. Either way the token's identity must be

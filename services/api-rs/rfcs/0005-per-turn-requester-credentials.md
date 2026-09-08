@@ -140,6 +140,21 @@ allowlisted. GitHubbot work sessions (`github-manage:`, `github-issue:`, and
 requester's identity; synthetic lifecycle turns remain requester-less because
 their actor ids are deliberately non-numeric.
 
+For a GitHub requester, the matching GitHub credential also anchors the Console
+user who consented. Reconciliation may therefore grant that same owner's other
+always-available OAuth wrappers, such as Linear, to the `github-user-*`
+principal. The owner must be unambiguous; otherwise no cross-provider grants
+are added. Trusted bot ingresses can mark providers required so a missing
+mapping or grant fails before sandbox provisioning instead of falling back to a
+shared credential.
+
+Linearbot uses a separate fetch-only `linearbot-agent` requester principal,
+provisioned by the deployment with an isolated `actor=app` credential.
+GitHubbot may carry that principal into automated PR-management turns only for
+a bot-authored PR with a standalone Linear `Prompted from:` marker. The session
+API admits these assertions only from the matching authenticated ingress and
+only for that fixed principal id.
+
 ### 2. Grant union on the proxy (console)
 
 Add nullable `proxies.requester_principal_id`, accepted by the proxy

@@ -127,6 +127,14 @@ mod tests {
         {
             Ok(test_principal(principal))
         }
+
+        async fn list_principal_grants(
+            &self,
+            _principal: &str,
+        ) -> Result<Vec<centaur_iron_control::Grant>, centaur_iron_control::IronControlError>
+        {
+            Ok(Vec::new())
+        }
     }
 
     fn test_principal(id: &str) -> centaur_iron_control::Principal {

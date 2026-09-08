@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use centaur_iron_control::{IronControlError, Principal, SessionRegistrar};
+use centaur_iron_control::{Grant, IronControlError, Principal, SessionRegistrar};
 use centaur_sandbox_core::{
     Mount, RepoCacheAccess, ResourceRequirements, SANDBOX_AGENT_HOME, SandboxBackend,
     SandboxCapabilities as BackendSandboxCapabilities, SandboxError, SandboxFile, SandboxId,
@@ -110,6 +110,8 @@ pub trait SessionPrincipalRegistrar: Send + Sync {
     ) -> Result<Option<Principal>, IronControlError>;
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError>;
+
+    async fn list_principal_grants(&self, principal: &str) -> Result<Vec<Grant>, IronControlError>;
 }
 
 #[async_trait::async_trait]
@@ -132,6 +134,10 @@ impl SessionPrincipalRegistrar for SessionRegistrar {
 
     async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
         SessionRegistrar::get_principal(self, principal).await
+    }
+
+    async fn list_principal_grants(&self, principal: &str) -> Result<Vec<Grant>, IronControlError> {
+        SessionRegistrar::list_principal_grants(self, principal).await
     }
 }
 
@@ -920,6 +926,13 @@ struct PersonaResolution {
     persona_id: Option<String>,
     context: Option<PersonaContext>,
     unavailable_requested_persona_id: Option<String>,
+}
+
+fn requester_connection_error(origin: &str) -> String {
+    if origin == "linear_app" {
+        return "The Linear app credential is unavailable for this delegated task. Ask an administrator to reconnect or reprovision the Linear app, then retry.".to_owned();
+    }
+    "This GitHub account is not connected to the required GitHub and Linear OAuth apps in Centaur Console. Connect both accounts, then retry.".to_owned()
 }
 
 impl SessionRuntime {
@@ -2201,9 +2214,17 @@ impl SessionRuntime {
                     }),
                 )
                 .await?;
-            let requester_principal_id = self
+            let requester_principal_id = match self
                 .resolve_requester_principal(thread_key, requester_metadata.as_ref())
-                .await;
+                .await
+            {
+                Ok(principal) => principal,
+                Err(error) => {
+                    self.record_execution_failure(thread_key, &execution.execution_id, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
             let desired_capabilities = match pre_resolved_sandbox_capabilities {
                 Some(capabilities) => capabilities,
                 None => {
@@ -3173,22 +3194,116 @@ impl SessionRuntime {
         result
     }
 
-    /// Resolve and upsert the principal of the human requesting this turn from
-    /// the execute metadata. `None` for DM and non-Slack threads (the
-    /// registrar decides) and on registrar failure: a broken requester lookup
-    /// must degrade to today's requester-less turn, never fail the execution.
+    /// Resolve and upsert the principal requesting this turn. Optional
+    /// requester lookups preserve the historical degrade-to-session behavior.
+    /// A trusted ingress can mark requester credentials required; then an
+    /// absent identity, reconciliation failure, or credential-less principal
+    /// fails before sandbox provisioning.
     async fn resolve_requester_principal(
         &self,
         thread_key: &ThreadKey,
         metadata: Option<&Value>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, SessionRuntimeError> {
+        let required = metadata
+            .and_then(|value| value.get("requester_credentials_required"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let requester_origin = metadata
+            .and_then(|value| value.get("requester_origin"))
+            .and_then(Value::as_str)
+            .unwrap_or("unspecified");
         match self
             .iron_control
             .register_requester(thread_key.as_str(), metadata)
             .await
         {
-            Ok(principal) => principal.map(|principal| principal.id),
+            Ok(Some(principal)) => {
+                if required {
+                    let grants = self
+                        .iron_control
+                        .list_principal_grants(&principal.id)
+                        .await?;
+                    if grants.is_empty() {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_requester_resolution_denied",
+                            thread_key = %thread_key,
+                            requester_principal = %principal.id,
+                            requester_origin,
+                            deny_reason = "no_requester_oauth_grants",
+                            "required requester has no connected OAuth credentials"
+                        );
+                        return Err(SessionRuntimeError::BadRequest(requester_connection_error(
+                            requester_origin,
+                        )));
+                    }
+                    let available_providers = principal
+                        .labels
+                        .get("requester_oauth_providers")
+                        .map(|value| value.split(',').collect::<BTreeSet<_>>())
+                        .unwrap_or_default();
+                    let missing_providers = metadata
+                        .and_then(|value| value.get("requester_required_providers"))
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|provider| !available_providers.contains(provider))
+                        .collect::<Vec<_>>();
+                    if !missing_providers.is_empty() {
+                        warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_requester_resolution_denied",
+                            thread_key = %thread_key,
+                            requester_principal = %principal.id,
+                            requester_origin,
+                            missing_providers = ?missing_providers,
+                            deny_reason = "required_oauth_provider_missing",
+                            "required requester OAuth provider is unavailable"
+                        );
+                        return Err(SessionRuntimeError::BadRequest(requester_connection_error(
+                            requester_origin,
+                        )));
+                    }
+                }
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_resolved",
+                    thread_key = %thread_key,
+                    requester_principal = %principal.id,
+                    requester_origin,
+                    credential_type = "requester_oauth",
+                    "resolved per-turn requester credentials"
+                );
+                Ok(Some(principal.id))
+            }
+            Ok(None) if required => {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_resolution_denied",
+                    thread_key = %thread_key,
+                    requester_origin,
+                    deny_reason = "requester_identity_unresolved",
+                    "required requester identity could not be resolved"
+                );
+                Err(SessionRuntimeError::BadRequest(requester_connection_error(
+                    requester_origin,
+                )))
+            }
+            Ok(None) => Ok(None),
             Err(error) => {
+                if required {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_requester_resolution_denied",
+                        thread_key = %thread_key,
+                        requester_origin,
+                        deny_reason = "requester_registration_failed",
+                        %error,
+                        "required requester registration failed"
+                    );
+                    return Err(error.into());
+                }
                 warn!(
                     component = COMPONENT_SESSION_RUNTIME,
                     event = "session_requester_registration_failed",
@@ -3196,7 +3311,7 @@ impl SessionRuntime {
                     %error,
                     "failed to register requester principal; proceeding without a requester"
                 );
-                None
+                Ok(None)
             }
         }
     }
@@ -8871,6 +8986,13 @@ mod adoption_tests {
 
         async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
             Ok(test_principal(principal))
+        }
+
+        async fn list_principal_grants(
+            &self,
+            _principal: &str,
+        ) -> Result<Vec<Grant>, IronControlError> {
+            Ok(Vec::new())
         }
     }
 
