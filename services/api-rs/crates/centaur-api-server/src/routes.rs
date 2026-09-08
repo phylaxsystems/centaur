@@ -767,7 +767,7 @@ async fn execute_session(
     Json(request): Json<ExecuteSessionRequest>,
 ) -> Result<Json<ExecuteSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let metadata = sanitize_execute_metadata(caller.class(), request.metadata);
+    let metadata = sanitize_execute_metadata(caller.class(), caller.identity(), request.metadata);
     let execution = state
         .runtime()?
         .enqueue_session_execution(
@@ -789,20 +789,91 @@ async fn execute_session(
     }))
 }
 
-/// `requester_principal_foreign_id` is an identity assertion made by the
-/// authenticated Console service, not ordinary caller-controlled metadata.
-/// Strip it from every other caller class before the execution is persisted so
-/// the runtime can safely honor Console requesters on any thread namespace.
+/// Requester identities are assertions made by authenticated first-party
+/// ingress services, not ordinary caller-controlled metadata. Console may name
+/// its provisioned principal; GitHubbot and Linearbot may name only the fixed
+/// Linear app principal with validated provenance.
 fn sanitize_execute_metadata(
     caller_class: CallerClass,
+    caller_identity: &str,
     mut metadata: Option<Value>,
 ) -> Option<Value> {
-    if caller_class != CallerClass::Console
-        && let Some(Value::Object(fields)) = metadata.as_mut()
-    {
-        fields.remove("requester_principal_foreign_id");
+    if let Some(Value::Object(fields)) = metadata.as_mut() {
+        if caller_class != CallerClass::Console {
+            let linear_origin =
+                fields.get("requester_origin").and_then(Value::as_str) == Some("linear_app");
+            let valid_origin_key = match caller_identity {
+                "githubbot" => fields
+                    .get("linear_issue_identifier")
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_linear_issue_identifier),
+                "linearbot" => fields
+                    .get("linear_issue_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty()),
+                _ => false,
+            };
+            let github_human = caller_identity == "githubbot"
+                && fields
+                    .get("user_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(valid_github_user_id);
+            let trusted_linear_app = caller_class == CallerClass::Ingress
+                && linear_origin
+                && valid_origin_key
+                && !github_human
+                && fields
+                    .get("requester_principal_foreign_id")
+                    .and_then(Value::as_str)
+                    == Some("linearbot-agent");
+            if !trusted_linear_app {
+                fields.remove("requester_principal_foreign_id");
+            }
+        }
+        let githubbot = caller_class == CallerClass::Ingress && caller_identity == "githubbot";
+        let linearbot = caller_class == CallerClass::Ingress && caller_identity == "linearbot";
+        if githubbot
+            && fields
+                .get("user_id")
+                .and_then(Value::as_str)
+                .is_some_and(valid_github_user_id)
+        {
+            fields.remove("requester_principal_foreign_id");
+            fields.remove("linear_issue_identifier");
+            fields.insert(
+                "requester_origin".to_owned(),
+                Value::String("github_user".to_owned()),
+            );
+        }
+        if !githubbot {
+            fields.remove("linear_issue_identifier");
+        }
+        if !linearbot {
+            fields.remove("linear_issue_id");
+        }
+        if !githubbot && !linearbot {
+            fields.remove("requester_credentials_required");
+            fields.remove("requester_required_providers");
+            fields.remove("requester_origin");
+        }
     }
     metadata
+}
+
+fn valid_github_user_id(value: &str) -> bool {
+    value.parse::<u64>().ok().is_some_and(|value| value > 0)
+}
+
+fn valid_linear_issue_identifier(value: &str) -> bool {
+    let Some((team, number)) = value.trim().split_once('-') else {
+        return false;
+    };
+    !team.is_empty()
+        && team
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
+        && !number.is_empty()
+        && number.chars().all(|character| character.is_ascii_digit())
 }
 
 async fn interrupt_session_execution(
@@ -962,7 +1033,11 @@ mod session_authorization_tests {
         });
 
         assert_eq!(
-            sanitize_execute_metadata(CallerClass::Console, Some(metadata.clone())),
+            sanitize_execute_metadata(
+                CallerClass::Console,
+                "centaur-console",
+                Some(metadata.clone())
+            ),
             Some(metadata.clone())
         );
         for caller_class in [
@@ -971,10 +1046,80 @@ mod session_authorization_tests {
             CallerClass::Principal,
         ] {
             assert_eq!(
-                sanitize_execute_metadata(caller_class, Some(metadata.clone())),
+                sanitize_execute_metadata(caller_class, "untrusted", Some(metadata.clone())),
                 Some(json!({ "source": "console" }))
             );
         }
+    }
+
+    #[test]
+    fn githubbot_human_keeps_native_identity_and_required_provider_gate() {
+        let metadata = json!({
+            "source": "githubbot",
+            "user_id": "12345",
+            "user_name": "octocat",
+            "requester_credentials_required": true,
+            "requester_required_providers": ["github", "linear"],
+            "requester_origin": "github_user"
+        });
+        assert_eq!(
+            sanitize_execute_metadata(CallerClass::Ingress, "githubbot", Some(metadata.clone())),
+            Some(metadata)
+        );
+        assert_eq!(
+            sanitize_execute_metadata(
+                CallerClass::Ingress,
+                "slackbot",
+                Some(json!({
+                    "user_id": "12345",
+                    "requester_credentials_required": true,
+                    "requester_origin": "github_user"
+                }))
+            ),
+            Some(json!({ "user_id": "12345" }))
+        );
+    }
+
+    #[test]
+    fn bots_may_assert_only_the_fixed_linear_app_principal() {
+        let github = json!({
+            "user_id": "github-pr-manager",
+            "requester_principal_foreign_id": "linearbot-agent",
+            "requester_credentials_required": true,
+            "requester_required_providers": ["linear"],
+            "requester_origin": "linear_app",
+            "linear_issue_identifier": "ENG-123"
+        });
+        assert_eq!(
+            sanitize_execute_metadata(CallerClass::Ingress, "githubbot", Some(github.clone())),
+            Some(github)
+        );
+
+        let linear = json!({
+            "requester_principal_foreign_id": "linearbot-agent",
+            "requester_credentials_required": true,
+            "requester_required_providers": ["linear"],
+            "requester_origin": "linear_app",
+            "linear_issue_id": "issue-uuid"
+        });
+        assert_eq!(
+            sanitize_execute_metadata(CallerClass::Ingress, "linearbot", Some(linear.clone())),
+            Some(linear)
+        );
+
+        assert_eq!(
+            sanitize_execute_metadata(
+                CallerClass::Ingress,
+                "githubbot",
+                Some(json!({
+                    "user_id": "12345",
+                    "requester_principal_foreign_id": "linearbot-agent",
+                    "requester_origin": "linear_app",
+                    "linear_issue_identifier": "ENG-123"
+                }))
+            ),
+            Some(json!({ "user_id": "12345", "requester_origin": "github_user" }))
+        );
     }
 }
 

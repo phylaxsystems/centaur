@@ -111,6 +111,14 @@ running work isn't dropped (claims are taken before the work, so a dropped turn 
 It also **serializes turns targeting the same session** so two turns can't interleave git/push in one
 sandbox. Both assume the **single replica** the chart runs (`replicaCount: 1`).
 
+Comment turns bind the immutable numeric GitHub author id as a required
+per-turn requester. Console maps that subject to the user who connected GitHub
+OAuth and hoists only that user's allowlisted OAuth wrappers; an unmapped user
+is rejected before a sandbox starts. The existing author-association allowlist
+still rejects public drive-by mentions before dispatch. Automated management of
+a bot-authored PR may instead retain the isolated `linearbot-agent` identity
+when the PR body has a standalone Linear `Prompted from:` provenance line.
+
 ## Auth
 
 A personal access token for the bot's GitHub teammate account is required (`GITHUB_TOKEN`). As a

@@ -683,7 +683,19 @@ function sessionMetadata(
     timestamp: message.timestamp,
     user_id: message.author.userId,
     user_name: message.author.userName,
+    ...linearAppRequesterMetadata(message.threadId),
     ...extra,
+  };
+}
+
+export function linearAppRequesterMetadata(threadId: string): JsonObject {
+  const issueId = threadId.match(/^linear:([^:]+)/)?.[1];
+  return {
+    requester_principal_foreign_id: "linearbot-agent",
+    requester_credentials_required: true,
+    requester_required_providers: ["linear"],
+    requester_origin: "linear_app",
+    ...(issueId ? { linear_issue_id: issueId } : {}),
   };
 }
 

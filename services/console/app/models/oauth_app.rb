@@ -17,6 +17,9 @@
 class OauthApp < ApplicationRecord
   oid_prefix "oap"
 
+  after_update_commit :reconcile_github_requester_provider_labels,
+                      if: :saved_change_to_always_available?
+
   URL_SAFE_FORMAT = /\A[A-Za-z0-9\-._~]+\z/
   URL_SAFE_MESSAGE = "must contain only URL-safe characters (A-Z, a-z, 0-9, -, ., _, ~)"
 
@@ -62,6 +65,10 @@ class OauthApp < ApplicationRecord
   end
 
   private
+
+  def reconcile_github_requester_provider_labels
+    PrincipalCredentialReconciliation.new.reconcile_github_requester_provider_labels
+  end
 
   def slug_does_not_shadow_oid
     return if slug.blank?

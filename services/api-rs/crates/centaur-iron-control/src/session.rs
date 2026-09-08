@@ -145,6 +145,10 @@ impl SessionRegistrar {
         self.client.get_principal(principal).await
     }
 
+    pub async fn list_principal_grants(&self, principal: &str) -> Result<Vec<crate::Grant>> {
+        self.client.list_principal_grants(principal).await
+    }
+
     /// Fold an existing principal's labels under the freshly derived ones so
     /// labels an operator or the console added survive re-registration.
     /// Returns whether the principal already existed.

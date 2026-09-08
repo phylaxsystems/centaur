@@ -92,6 +92,12 @@ class PrincipalCredentialReconciliation
     end
   end
 
+  def reconcile_github_requester_provider_labels
+    Principal.where(kind: "github_user").find_each do |principal|
+      sync_github_requester_oauth_providers(principal)
+    end
+  end
+
   private
 
   # Every registered OAuth-flow provider participates: a provider without
@@ -118,6 +124,8 @@ class PrincipalCredentialReconciliation
       return
     end
 
+    sync_github_requester_oauth_providers(principal)
+
     google_credentials = credentials.select do |credential|
       credential.oauth_app&.provider == GOOGLE_PROVIDER
     end
@@ -133,6 +141,38 @@ class PrincipalCredentialReconciliation
     return if updates.empty?
 
     principal.update!(labels: labels.merge(updates))
+  end
+
+  def sync_github_requester_oauth_providers(principal)
+    return if principal_subjects(principal, GITHUB_PROVIDER).empty?
+
+    owner_id = github_anchor_owner_id(principal)
+    unless owner_id
+      labels = principal.labels || {}
+      return unless labels.key?("requester_oauth_providers")
+
+      principal.update!(labels: labels.except("requester_oauth_providers"))
+      return
+    end
+
+    providers = BrokerCredential
+      .joins(:oauth_app, :static_secret)
+      .where(created_by_id: owner_id)
+      .where(oauth_apps: { always_available: true })
+      .distinct
+      .order("oauth_apps.provider")
+      .pluck("oauth_apps.provider")
+    labels = principal.labels || {}
+    if providers.empty?
+      return unless labels.key?("requester_oauth_providers")
+
+      principal.update!(labels: labels.except("requester_oauth_providers"))
+      return
+    end
+    value = providers.join(",")
+    return if labels["requester_oauth_providers"] == value
+
+    principal.update!(labels: labels.merge("requester_oauth_providers" => value))
   end
 
   def grant_credential(principal, credential)
@@ -151,6 +191,7 @@ class PrincipalCredentialReconciliation
 
     indexes ||= credential_indexes
     emails = principal_emails(principal)
+    github_owner_id = github_anchor_owner_id(principal, indexes[GITHUB_PROVIDER][:subjects])
     credentials_by_provider = providers.each_with_object({}) do |provider, acc|
       matched = provider_credentials_for(
         principal,
@@ -159,7 +200,8 @@ class PrincipalCredentialReconciliation
         email_index: indexes[provider][:emails],
         owner_index: indexes[provider][:owners],
         console_user_index: indexes[provider][:console_users],
-        emails: emails
+        emails: emails,
+        github_owner_id: github_owner_id
       )
       acc[provider] = matched if matched.any?
     end
@@ -252,11 +294,23 @@ class PrincipalCredentialReconciliation
     email_index:,
     owner_index:,
     console_user_index:,
-    emails:
+    emails:,
+    github_owner_id:
   )
     if console_user_principal?(principal)
       return (credentials_for_console_user(principal, provider, console_user_index) +
         credentials_for_emails(principal, emails, email_index, provider)).uniq
+    end
+
+    if principal_subjects(principal, GITHUB_PROVIDER).any?
+      return [] unless github_owner_id
+      if provider == GITHUB_PROVIDER
+        return credentials_for_subject_labels(principal, provider, subject_index)
+          .select { |credential| credential.created_by_id == github_owner_id }
+      end
+
+      return (console_user_index[github_owner_id] || [])
+        .select { |credential| supported_provider?(credential) }
     end
 
     native = credentials_for_subject_labels(principal, provider, subject_index)
@@ -307,6 +361,14 @@ class PrincipalCredentialReconciliation
       return credential.created_by_id == principal.console_user_id ||
              principal_emails(principal).include?(normalize_email(credential.provider_email))
     end
+    github_subjects = principal_subjects(principal, GITHUB_PROVIDER)
+    if github_subjects.any?
+      owner_id = github_anchor_owner_id(principal)
+      return false unless owner_id && credential.created_by_id == owner_id
+      return true unless provider == GITHUB_PROVIDER
+
+      return github_subjects.include?(normalize_key(credential.provider_subject))
+    end
 
     subjects = principal_subjects(principal, provider)
     if subjects.any?
@@ -315,6 +377,21 @@ class PrincipalCredentialReconciliation
       owner_identity_matches_principal?(principal, credential) ||
         principal_emails(principal).include?(normalize_email(credential.provider_email))
     end
+  end
+
+  def github_anchor_owner_id(principal, subject_index = nil)
+    subjects = principal_subjects(principal, GITHUB_PROVIDER)
+    return nil if subjects.empty?
+
+    credentials = if subject_index
+      subjects.flat_map { |subject| subject_index[subject] || [] }
+    else
+      provider_credentials(GITHUB_PROVIDER).select do |credential|
+        subjects.include?(normalize_key(credential.provider_subject))
+      end
+    end
+    owners = credentials.filter_map(&:created_by_id).uniq
+    owners.one? ? owners.first : nil
   end
 
   # A credential also matches through the console user who consented to it:

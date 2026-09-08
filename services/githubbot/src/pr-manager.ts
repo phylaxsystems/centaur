@@ -198,17 +198,19 @@ function assigneeLogins(
   return value.map((a) => a?.login ?? "").filter(Boolean);
 }
 
-function summarizePr(pr: {
-  draft?: boolean | null;
-  head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
-  labels: { name?: string }[];
-  mergeable_state?: string;
-  merged?: boolean;
-  number: number;
-  state: string;
-  title: string;
-  assignees?: ({ login?: string } | null)[] | null;
-}): PullRequestSummary {
+function summarizePr(
+  pr: {
+    draft?: boolean | null;
+    head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
+    labels: { name?: string }[];
+    mergeable_state?: string;
+    merged?: boolean;
+    number: number;
+    state: string;
+    title: string;
+    assignees?: ({ login?: string } | null)[] | null;
+  },
+): PullRequestSummary {
   return {
     assignees: assigneeLogins(pr.assignees),
     draft: pr.draft === true,
@@ -706,7 +708,11 @@ function fireManagementTurn(
     afterEventId: 0,
     contextPreamble,
     conversationName: `${owner}/${repo}#${pr.number}: ${pr.title}`,
-    executeMessage: managementMessage(message.id, threadKey, message.text),
+    executeMessage: managementMessage(
+      message.id,
+      threadKey,
+      message.text,
+    ),
     messages: [],
     model: undefined,
     onEventId: (eventId) => {
@@ -774,6 +780,8 @@ function managementMessage(
     },
     id,
     isMention: true,
+    // Only signed Linear ingress may assert the app principal; mutable PR
+    // metadata is never copied into requester identity fields.
     raw: { githubbotManagement: true },
     text,
     threadId: threadKey,
