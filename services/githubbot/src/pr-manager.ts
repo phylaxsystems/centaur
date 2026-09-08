@@ -189,22 +189,7 @@ type PullRequestSummary = {
   number: number;
   state: string;
   title: string;
-  linearOrigin?: LinearOrigin;
 };
-
-export type LinearOrigin = { identifier: string; url: string };
-
-export function linearOriginFromPullRequest(input: {
-  authorLogin?: string | null;
-  body?: string | null;
-  botUserName: string;
-}): LinearOrigin | undefined {
-  if (input.authorLogin?.toLowerCase() !== input.botUserName.toLowerCase()) return undefined;
-  const match = input.body?.match(
-    /^Prompted from:\s+(https:\/\/linear\.app\/[^/\s]+\/issue\/([A-Z][A-Z0-9]+-[0-9]+)(?:\/[^\s]*)?)\s*$/im,
-  );
-  return match ? { url: match[1]!, identifier: match[2]! } : undefined;
-}
 
 function assigneeLogins(
   value: ({ login?: string } | null)[] | null | undefined,
@@ -224,10 +209,7 @@ function summarizePr(
     state: string;
     title: string;
     assignees?: ({ login?: string } | null)[] | null;
-    body?: string | null;
-    user?: { login?: string | null } | null;
   },
-  botUserName: string,
 ): PullRequestSummary {
   return {
     assignees: assigneeLogins(pr.assignees),
@@ -241,11 +223,6 @@ function summarizePr(
     number: pr.number,
     state: pr.state,
     title: pr.title,
-    linearOrigin: linearOriginFromPullRequest({
-      authorLogin: pr.user?.login,
-      body: pr.body,
-      botUserName,
-    }),
   };
 }
 
@@ -261,7 +238,7 @@ async function fetchPr(
       repo,
       pull_number: n,
     });
-    return summarizePr(data as Parameters<typeof summarizePr>[0], ctx.userName);
+    return summarizePr(data as Parameters<typeof summarizePr>[0]);
   } catch (error) {
     logger(ctx).warn("githubbot_pr_fetch_failed", {
       error: errorMessage(error),
@@ -735,7 +712,6 @@ function fireManagementTurn(
       message.id,
       threadKey,
       message.text,
-      pr.linearOrigin,
     ),
     messages: [],
     model: undefined,
@@ -792,7 +768,6 @@ function managementMessage(
   id: string,
   threadKey: string,
   text: string,
-  linearOrigin?: LinearOrigin,
 ): GithubbotApiMessage {
   return {
     attachments: [],
@@ -805,16 +780,9 @@ function managementMessage(
     },
     id,
     isMention: true,
-    raw: {
-      githubbotManagement: true,
-      ...(linearOrigin
-        ? {
-            requesterPrincipalForeignId: "linearbot-agent",
-            linearIssueIdentifier: linearOrigin.identifier,
-            linearIssueUrl: linearOrigin.url,
-          }
-        : {}),
-    },
+    // Only signed Linear ingress may assert the app principal; mutable PR
+    // metadata is never copied into requester identity fields.
+    raw: { githubbotManagement: true },
     text,
     threadId: threadKey,
     timestamp: new Date().toISOString(),

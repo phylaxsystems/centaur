@@ -147,6 +147,27 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
     refute principal.grants.exists?(static_secret: secret)
   end
 
+  test "changing always_available reconciles the cached provider label both ways" do
+    user = users(:member_user)
+    create_credential(oauth_apps(:acme_github), "24680", nil, created_by: user)
+    create_credential(oauth_apps(:acme_linear), "linear-24680", nil, created_by: user)
+    principal = Principal.create!(
+      foreign_id: "github-user-24680",
+      kind: "github_user",
+      labels: { "github_subject" => "24680" },
+      created_by: users(:acme_admin)
+    )
+
+    oauth_apps(:acme_github).update!(always_available: true)
+    assert_equal "github", principal.reload.labels["requester_oauth_providers"]
+
+    oauth_apps(:acme_github).update!(always_available: false)
+    assert_nil principal.reload.labels["requester_oauth_providers"]
+
+    oauth_apps(:acme_github).update!(always_available: true)
+    assert_equal "github", principal.reload.labels["requester_oauth_providers"]
+  end
+
   test "ambiguous GitHub subject does not anchor either credential owner" do
     first = create_credential(
       oauth_apps(:acme_github), "77777", nil, created_by: users(:member_user)

@@ -5,7 +5,6 @@ import {
   handleCiEvent,
   handleReviewEvent,
   isOwnedPr,
-  linearOriginFromPullRequest,
   type PrManagerContext,
 } from "../src/pr-manager";
 import { emitWorkflowEvent } from "../src/session-api";
@@ -58,38 +57,6 @@ function prPayload(input: {
     title: "Test PR",
   };
 }
-
-describe("linearOriginFromPullRequest", () => {
-  test("accepts standalone Linear provenance only on a bot-authored PR", () => {
-    expect(
-      linearOriginFromPullRequest({
-        authorLogin: "centaur-bot",
-        body: "Summary\n\nPrompted from: https://linear.app/acme/issue/ENG-123/fix-it",
-        botUserName: "centaur-bot",
-      }),
-    ).toEqual({
-      identifier: "ENG-123",
-      url: "https://linear.app/acme/issue/ENG-123/fix-it",
-    });
-  });
-
-  test("rejects human-authored or prose-embedded Linear links", () => {
-    for (const input of [
-      {
-        authorLogin: "human",
-        body: "Prompted from: https://linear.app/acme/issue/ENG-123/fix-it",
-      },
-      {
-        authorLogin: "centaur-bot",
-        body: "See Prompted from: https://linear.app/acme/issue/ENG-123/fix-it inline",
-      },
-    ]) {
-      expect(
-        linearOriginFromPullRequest({ ...input, botUserName: "centaur-bot" }),
-      ).toBeUndefined();
-    }
-  });
-});
 
 describe("evaluateCi", () => {
   test("not settled while any check is in progress", () => {

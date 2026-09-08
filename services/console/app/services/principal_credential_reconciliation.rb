@@ -92,6 +92,12 @@ class PrincipalCredentialReconciliation
     end
   end
 
+  def reconcile_github_requester_provider_labels
+    Principal.where(kind: "github_user").find_each do |principal|
+      sync_github_requester_oauth_providers(principal)
+    end
+  end
+
   private
 
   # Every registered OAuth-flow provider participates: a provider without
