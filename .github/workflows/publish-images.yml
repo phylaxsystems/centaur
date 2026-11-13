@@ -43,8 +43,8 @@ jobs:
       github.repository == 'phylaxsystems/centaur' &&
       github.event_name != 'pull_request' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) &&
-      vars.CENTAUR_PUBLISH_ENABLED == 'true'
-    runs-on: ubuntu-24.04
+      vars.CENTAUR_PUBLISH_ENABLED == 'true' && vars.CENTAUR_BUILD_RUNNER != ''
+    runs-on: ${{ vars.CENTAUR_BUILD_RUNNER }}
     timeout-minutes: 180
     environment: centaur-publish
     permissions:

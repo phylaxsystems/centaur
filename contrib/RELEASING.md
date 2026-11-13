@@ -52,11 +52,12 @@ equals `true`. Before enabling it:
    private; the publisher checks privacy again after writing and fails on API
    authorization errors. Grant consumers read access separately. Do not make
    a package public to bypass a pull failure.
-3. Validate build capacity on the selected runner. The workflow currently uses
-   GitHub-hosted Ubuntu and Buildx/QEMU, with no upstream Depot project or
-   credentials. Nine multi-architecture builds, especially the sandbox and
-   Rust services, may need a larger approved runner; capacity and duration
-   have not been measured. Change the runner by reviewed PR if necessary.
+3. Set repository variable `CENTAUR_BUILD_RUNNER` to an approved Ubuntu runner
+   label with Docker, Python, Go and enough disk/memory for nine multi-arch
+   builds. Publication also stays disabled while this variable is empty.
+   Buildx/QEMU needs no upstream Depot project or credentials. The default
+   small GitHub runner is not assumed sufficient; measure capacity and
+   duration before approving it. Read-only validation uses standard Ubuntu.
 4. Review the source baseline, runtime/security fixes and controller CRD
    compatibility against the intended consumer. This publishing change is not
    a runtime upgrade or a controller migration.
