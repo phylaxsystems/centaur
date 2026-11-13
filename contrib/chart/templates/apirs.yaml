@@ -390,6 +390,18 @@ spec:
             - name: SESSION_SANDBOX_PRIORITY_CLASS_NAME
               value: {{ .Values.sandbox.priorityClassName | quote }}
 {{- end }}
+{{- $runtimeReleaseLabel := ((.Values.networkPolicy).runtimeReleaseLabel) | default dict }}
+{{- if $runtimeReleaseLabel.enabled }}
+            # Immutable per-release identity for every pod this control plane
+            # creates at runtime: session sandboxes, workflow hosts, and their
+            # paired iron-proxies. The NetworkPolicies this chart renders match
+            # it on every selector that targets those pods, so a release that
+            # shares a namespace with another still cannot reach its Postgres
+            # or its api-rs. Namespace-per-release remains the first boundary;
+            # this is the second one.
+            - name: SESSION_SANDBOX_RELEASE_ID_LABEL
+              value: {{ printf "%s=%s" (required "networkPolicy.runtimeReleaseLabel.key is required when runtimeReleaseLabel.enabled" $runtimeReleaseLabel.key) (default .Release.Name $runtimeReleaseLabel.value) | quote }}
+{{- end }}
             # Sandboxes call back into this control plane via the in-cluster Service.
             - name: SESSION_SANDBOX_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}

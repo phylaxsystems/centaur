@@ -790,6 +790,19 @@ postgres:
     enabled: true
     sizeLimit: 1Gi
   resources: {}
+  # Placement for the bundled database. The StatefulSet's volumeClaimTemplate
+  # is ReadWriteOnce, and on a node-local StorageClass (local-path, or any
+  # hostPath provisioner) the first bind pins the volume -- and with it the
+  # whole control and history database -- to whichever node the pod happened
+  # to land on. On a heterogeneous cluster that node can be one the database
+  # was never meant to occupy: a control-plane member, or a host whose disks
+  # are committed to something else. Set these so the pin is a decision.
+  nodeSelector: {}
+  #   workload: database
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
 
 ingress:
   enabled: false
@@ -819,6 +832,65 @@ networkPolicy:
   # the egress rule must allow it. Defaults to 6443 (k3s, kubeadm). Set to 443
   # on clusters whose API server endpoint already listens on 443.
   apiServerPort: 6443
+  # How "the public internet" is expressed. A NetworkPolicy egress item that
+  # carries only `ports` and no `to` matches EVERY destination -- other pods,
+  # other namespaces, the node VLAN, the tailnet, and 169.254.169.254 -- so
+  # this chart renders no such item. Every outbound-HTTPS rule (the bots, the
+  # workflow hosts, api-rs, connect-sync, repo-cache) is scoped to these
+  # blocks instead.
+  publicEgress:
+    # ipBlocks that stand for the public internet. The `except` list is what
+    # makes them public: RFC1918 covers the pod and service CIDRs of nearly
+    # every cluster as well as site VLANs, 100.64/10 covers CGNAT and
+    # tailnets, 169.254/16 covers link-local and cloud instance metadata.
+    ipBlocks:
+      - cidr: 0.0.0.0/0
+        except:
+          - 10.0.0.0/8
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+          - 100.64.0.0/10
+          - 169.254.0.0/16
+          - 127.0.0.0/8
+          - 224.0.0.0/4
+    # Appended to the `except` of every block above. For a pod or service
+    # CIDR outside RFC1918, a second site VLAN, or an IPv6 range once a block
+    # for ::/0 is added.
+    extraExcept: []
+  # Where the Kubernetes API actually lives. api-rs needs egress to it to
+  # create sandboxes; the kubernetes.default ClusterIP is DNAT'd to the real
+  # endpoint before an enforcing CNI matches egress, so this has to name the
+  # control-plane addresses (or the VLAN they sit on), not the service CIDR.
+  # Required when networkPolicy.enabled and apiRs.enabled, because the
+  # alternative -- a destination-free rule on apiServerPort -- opens that port
+  # to the whole cluster.
+  apiServer:
+    cidrs: []
+    #   - 10.0.0.0/24
+  # Escape hatch for a cluster whose CNI does not enforce NetworkPolicy, or
+  # for an upgrade that has not yet filled in the two keys above: render the
+  # old destination-free `ports`-only egress items instead of failing the
+  # render. It allows those ports to every destination. Off by default; a
+  # deployment that sets it should say why in its values file.
+  allowUnscopedEgress: false
+  # Second boundary for the pods api-rs creates at runtime (session and
+  # workflow-host sandboxes, and their paired iron-proxies). Namespace
+  # identity is the first and the strong one -- every podSelector in this
+  # chart's policies is namespace-local, so a release in another namespace
+  # cannot match them at all. This adds an immutable per-release label to
+  # every selector that targets a runtime-created pod, so two releases sharing
+  # one namespace are still separated.
+  #
+  # It is off by default because the label has to be stamped by api-rs, not by
+  # this chart: nothing rendered here can reach a pod created at runtime. Turn
+  # it on only against an api-rs that honours SESSION_SANDBOX_RELEASE_ID_LABEL
+  # -- with it on and the binary not stamping the label, every runtime pod is
+  # denied by the default-deny and no session starts.
+  runtimeReleaseLabel:
+    enabled: false
+    key: centaur.ai/release-id
+    # Defaults to .Release.Name when empty.
+    value: ""
   # Egress to an in-cluster OTLP trace collector (e.g. Laminar) in another
   # namespace. The policy selects only pods labeled
   # centaur.ai/observability-enabled=true, matching observabilityEgress. api-rs

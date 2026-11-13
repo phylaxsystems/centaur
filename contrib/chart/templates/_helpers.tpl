@@ -213,3 +213,104 @@ IRON_CONTROL_API_KEY (their names are hardcoded in the Rust binaries); the URL
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- printf "http://%s:%v" (include "centaur.consoleHost" .) $console.service.httpPort -}}
 {{- end -}}
+
+{{- /*
+Selectors for the pods api-rs creates at runtime.
+
+A NetworkPolicy podSelector is namespace-local, so these already cannot reach
+across namespaces -- namespace-per-release is the primary boundary. When two
+releases must share a namespace, `networkPolicy.runtimeReleaseLabel` adds a
+second one: an immutable per-release label that api-rs stamps on every session
+sandbox, workflow host and iron-proxy it creates, and that every selector below
+matches. See values.yaml for why it is off by default.
+*/ -}}
+{{- define "centaur.runtimeReleaseSelector" -}}
+{{- $rl := ((.Values.networkPolicy).runtimeReleaseLabel) | default dict -}}
+{{- if $rl.enabled }}
+{{ required "networkPolicy.runtimeReleaseLabel.key is required when runtimeReleaseLabel.enabled" $rl.key }}: {{ default .Release.Name $rl.value | quote }}
+{{- end -}}
+{{- end -}}
+
+{{- define "centaur.workflowRunSelectorLabels" -}}
+centaur.ai/component: workflow-run
+{{- include "centaur.runtimeReleaseSelector" . }}
+{{- end -}}
+
+{{- define "centaur.ironProxySelectorLabels" -}}
+centaur.ai/iron-proxy: "true"
+{{- include "centaur.runtimeReleaseSelector" . }}
+{{- end -}}
+
+{{- define "centaur.observabilityEnabledSelectorLabels" -}}
+centaur.ai/observability-enabled: "true"
+{{- include "centaur.runtimeReleaseSelector" . }}
+{{- end -}}
+
+{{- /*
+Egress destinations.
+
+An egress item with `ports` and no `to` matches every destination there is, so
+the chart never renders one. `centaur.publicEgressRule` renders a whole egress
+item scoped to networkPolicy.publicEgress.ipBlocks (0.0.0.0/0 minus everything
+that is not the public internet); `centaur.apiServerEgressRule` renders the one
+for the Kubernetes API. `networkPolicy.allowUnscopedEgress` restores the old
+destination-free items for a cluster whose CNI does not enforce policy.
+*/ -}}
+{{- define "centaur.publicEgressTo" -}}
+{{- $blocks := ((.Values.networkPolicy.publicEgress).ipBlocks) | default list -}}
+{{- if not $blocks -}}
+{{- fail "networkPolicy.publicEgress.ipBlocks must list at least one ipBlock, or set networkPolicy.allowUnscopedEgress=true to keep the destination-free egress rules" -}}
+{{- end -}}
+{{- $extra := ((.Values.networkPolicy.publicEgress).extraExcept) | default list -}}
+{{- range $blocks }}
+- ipBlock:
+    cidr: {{ required "networkPolicy.publicEgress.ipBlocks[].cidr is required" .cidr | quote }}
+{{- $except := concat (default list .except) $extra }}
+{{- if $except }}
+    except:
+{{- range $except }}
+      - {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "centaur.publicEgressRule" -}}
+{{- $root := .root -}}
+{{- if $root.Values.networkPolicy.allowUnscopedEgress }}
+- ports:
+{{- range .ports }}
+    - protocol: TCP
+      port: {{ . }}
+{{- end }}
+{{- else }}
+- to:{{ include "centaur.publicEgressTo" $root | nindent 4 }}
+  ports:
+{{- range .ports }}
+    - protocol: TCP
+      port: {{ . }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- define "centaur.apiServerEgressRule" -}}
+{{- $port := .Values.networkPolicy.apiServerPort -}}
+{{- if .Values.networkPolicy.allowUnscopedEgress }}
+- ports:
+    - protocol: TCP
+      port: {{ $port }}
+{{- else }}
+{{- $cidrs := ((.Values.networkPolicy.apiServer).cidrs) | default list -}}
+{{- if not $cidrs -}}
+{{- fail "networkPolicy.apiServer.cidrs must name the control-plane endpoints api-rs may reach on networkPolicy.apiServerPort; a rule with only that port opens it to every destination. Set the CIDRs, or set networkPolicy.allowUnscopedEgress=true." -}}
+{{- end -}}
+- to:
+{{- range $cidrs }}
+    - ipBlock:
+        cidr: {{ . | quote }}
+{{- end }}
+  ports:
+    - protocol: TCP
+      port: {{ $port }}
+{{- end }}
+{{- end -}}

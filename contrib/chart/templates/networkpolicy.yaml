@@ -59,7 +59,7 @@ spec:
         # centaur.ai/component=workflow-run.
         - podSelector:
             matchLabels:
-              centaur.ai/component: workflow-run
+{{ include "centaur.workflowRunSelectorLabels" . | nindent 14 }}
 {{- end }}
 {{- if .Values.slackbotv2.enabled }}
         - podSelector:
@@ -104,7 +104,7 @@ spec:
         # directly), so the proxy must be allowed to connect.
         - podSelector:
             matchLabels:
-              centaur.ai/iron-proxy: "true"
+{{ include "centaur.ironProxySelectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: 5432
@@ -127,7 +127,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      centaur.ai/component: workflow-run
+{{ include "centaur.workflowRunSelectorLabels" . | nindent 6 }}
   policyTypes:
     - Egress
   egress:
@@ -140,10 +140,10 @@ spec:
         - protocol: TCP
           port: 5432
 {{- end }}
-    # Trusted workflow code may make direct outbound HTTPS calls (mirrors api-rs).
-    - ports:
-        - protocol: TCP
-          port: 443
+    # Trusted workflow code may make direct outbound HTTPS calls (mirrors
+    # api-rs) -- to the public internet, and only there. An item with `ports`
+    # and no `to` would allow 443 to every in-cluster and private endpoint too.
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -196,7 +196,7 @@ spec:
         # iron-proxy; sandbox pods never connect to api-rs directly.
         - podSelector:
             matchLabels:
-              centaur.ai/iron-proxy: "true"
+{{ include "centaur.ironProxySelectorLabels" . | nindent 14 }}
 {{- range .Values.networkPolicy.apiIngressSourceNamespaces }}
         - namespaceSelector:
             matchLabels:
@@ -218,7 +218,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      centaur.ai/iron-proxy: "true"
+{{ include "centaur.ironProxySelectorLabels" . | nindent 6 }}
   policyTypes:
     - Egress
   egress:
@@ -245,7 +245,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      centaur.ai/observability-enabled: "true"
+{{ include "centaur.observabilityEnabledSelectorLabels" . | nindent 6 }}
   policyTypes:
     - Egress
   egress:
@@ -286,7 +286,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      centaur.ai/observability-enabled: "true"
+{{ include "centaur.observabilityEnabledSelectorLabels" . | nindent 6 }}
   policyTypes:
     - Egress
   egress:
@@ -325,7 +325,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              centaur.ai/iron-proxy: "true"
+{{ include "centaur.ironProxySelectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.ironProxy.service.proxyPort }}
@@ -341,15 +341,13 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $console.service.httpPort }}
-    - ports:
-        - protocol: TCP
-          port: 443
+    # Outbound HTTPS to the public internet (model APIs, GitHub, webhooks).
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
     # Kubernetes API egress. The kubernetes.default ClusterIP (:443) is DNAT'd
     # to the real endpoint port (6443 on k3s/kubeadm); enforcing CNIs match
-    # egress post-DNAT, so allow that port or api-rs can't manage sandboxes.
-    - ports:
-        - protocol: TCP
-          port: {{ .Values.networkPolicy.apiServerPort }}
+    # egress post-DNAT, so allow that port -- scoped to the control-plane
+    # addresses, or the rule opens that port cluster-wide.
+{{ include "centaur.apiServerEgressRule" . | nindent 4 }}
 ---
 {{- end }}
 {{- if .Values.slackbotv2.enabled }}
@@ -396,9 +394,7 @@ spec:
           port: 5432
 {{- end }}
     # Slack API egress (direct HTTPS; slackbotv2 does not use the firewall proxy).
-    - ports:
-        - protocol: TCP
-          port: 443
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 ---
 {{- end }}
 {{- if .Values.linearbot.enabled }}
@@ -445,9 +441,7 @@ spec:
           port: 5432
 {{- end }}
     # Linear GraphQL API egress (direct HTTPS; linearbot does not use the firewall proxy).
-    - ports:
-        - protocol: TCP
-          port: 443
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 ---
 {{- end }}
 {{- if .Values.githubbot.enabled }}
@@ -494,9 +488,7 @@ spec:
           port: 5432
 {{- end }}
     # GitHub REST API egress (direct HTTPS; githubbot does not use the firewall proxy).
-    - ports:
-        - protocol: TCP
-          port: 443
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 ---
 {{- end }}
 {{- if .Values.discordbot.enabled }}
@@ -545,9 +537,7 @@ spec:
 {{- end }}
     # Discord Gateway (wss), REST, and CDN all need direct HTTPS egress. The Gateway cannot be
     # proxied (discord.js ignores HTTPS_PROXY), so this rule is load-bearing.
-    - ports:
-        - protocol: TCP
-          port: 443
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 ---
 {{- end }}
 {{- if .Values.teamsbot.enabled }}
@@ -594,9 +584,7 @@ spec:
           port: 5432
 {{- end }}
     # Teams Bot Framework, Graph, SharePoint, and proactive activity delivery use direct HTTPS.
-    - ports:
-        - protocol: TCP
-          port: 443
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 ---
 {{- end }}
 {{- if eq .Values.ironProxy.secretSource "onepassword-connect" }}
@@ -619,15 +607,13 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              centaur.ai/iron-proxy: "true"
+{{ include "centaur.ironProxySelectorLabels" . | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ include "centaur.onepasswordConnectPort" . }}
   egress:
     # connect-sync needs outbound HTTPS to my.1password.com.
-    - ports:
-        - protocol: TCP
-          port: 443
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 ---
 {{- end }}
 {{- if .Values.repoCache.enabled }}
@@ -644,11 +630,9 @@ spec:
   policyTypes:
     - Egress
   egress:
-{{- range .Values.repoCache.egressPorts }}
-    - ports:
-        - protocol: TCP
-          port: {{ . }}
-{{- end }}
+    # repo-cache clones from public forges only; the ports are configurable
+    # (443 by default, 22 where SSH remotes are used).
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" .Values.repoCache.egressPorts) | nindent 4 }}
 ---
 {{- end }}
 {{- end }}

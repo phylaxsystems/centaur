@@ -93,6 +93,30 @@ spec:
       schedulerName: default-scheduler
       securityContext: {}
       terminationGracePeriodSeconds: 30
+      # Placement. The volumeClaimTemplate below is ReadWriteOnce, so on a
+      # node-local StorageClass the first bind pins this database to whichever
+      # node the pod landed on. Without these keys that node is whatever the
+      # scheduler happened to pick, on a cluster whose nodes are not
+      # interchangeable.
+      {{- with .Values.postgres.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgres.affinity }}
+      affinity:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgres.tolerations }}
+      tolerations:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgres.topologySpreadConstraints }}
+      topologySpreadConstraints:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgres.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
   updateStrategy:
     rollingUpdate:
       partition: 0

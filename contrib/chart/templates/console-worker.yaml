@@ -224,9 +224,8 @@ spec:
         - protocol: TCP
           port: {{ .Values.apiRs.port }}
 {{- end }}
-    # Outbound HTTPS to OAuth token endpoints for the broker refresh loop.
-    - ports:
-        - protocol: TCP
-          port: 443
+    # Outbound HTTPS to OAuth token endpoints for the broker refresh loop, on
+    # the public internet.
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
     # DNS egress is provided by the namespace-wide allow-dns policy.
 {{- end }}

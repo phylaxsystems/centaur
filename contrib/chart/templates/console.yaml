@@ -327,7 +327,7 @@ spec:
         # Per-sandbox iron-proxy pods pulling their config in managed mode.
         - podSelector:
             matchLabels:
-              centaur.ai/iron-proxy: "true"
+{{ include "centaur.ironProxySelectorLabels" . | nindent 14 }}
 {{- if $console.ingress.enabled }}
         # Ingress controller pods (Tailscale operator, Cloudflare, ...)
         # forwarding external traffic to console.
@@ -359,8 +359,6 @@ spec:
         - protocol: TCP
           port: {{ .Values.apiRs.port }}
 {{- end }}
-    # Outbound HTTPS (external DB DSNs, IdPs, etc.).
-    - ports:
-        - protocol: TCP
-          port: 443
+    # Outbound HTTPS (external DB DSNs, IdPs, etc.) to the public internet.
+{{ include "centaur.publicEgressRule" (dict "root" . "ports" (list 443)) | nindent 4 }}
 {{- end }}
